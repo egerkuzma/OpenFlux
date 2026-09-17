@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -34,6 +35,29 @@ import (
 
 // dnsQueryTimeout bounds one upstream DNS-over-TCP exchange.
 const dnsQueryTimeout = 8 * time.Second
+
+// maxDNSPayload is how much DNS fits in one datagram on our utun: the MTU set
+// in SetupInterface, minus the IPv4 and UDP headers. A DNS-over-TCP answer has
+// no 512-byte limit and routinely exceeds this; injecting an oversized packet
+// would fail to write and, before the write loop was hardened, killed inbound
+// traffic outright. Truncating with the TC bit set is the protocol's own
+// answer: the client immediately retries over TCP, which the tunnel carries
+// natively and which we do not intercept.
+const tunMTU = 1280
+const maxDNSPayload = tunMTU - 20 - 8
+
+// truncateDNS shortens an answer that cannot fit in one datagram and sets the
+// TC (truncated) flag so the querier retries over TCP.
+func truncateDNS(answer []byte) []byte {
+	if len(answer) <= maxDNSPayload {
+		return answer
+	}
+	out := append([]byte(nil), answer[:maxDNSPayload]...)
+	if len(out) > 2 {
+		out[2] |= 0x02 // TC
+	}
+	return out
+}
 
 // dnsSem caps concurrent upstream DNS resolutions so a burst of queries cannot
 // spawn an unbounded number of tunnelled TCP connections.
@@ -92,6 +116,10 @@ func (c *TUNClient) handleDNSQuery(pkt []byte, ihl int) {
 		return
 	}
 	utils.Debugf("[DNS] %s answered %d bytes over TCP", dest, len(answer))
+	if len(answer) > maxDNSPayload {
+		utils.Debugf("[DNS] answer %d bytes exceeds %d, truncating with TC set", len(answer), maxDNSPayload)
+		answer = truncateDNS(answer)
+	}
 
 	resp := buildDNSResponse(pkt[:ihl], srcIP, dstIP, srcPort, dstPort, answer)
 	if resp == nil {
@@ -155,8 +183,8 @@ func buildDNSResponse(ipHdr, srcIP, dstIP, srcPort, dstPort, answer []byte) []by
 	binary.BigEndian.PutUint16(resp[2:4], uint16(total))
 	binary.BigEndian.PutUint16(resp[4:6], 0) // fresh ID, no fragmentation
 	binary.BigEndian.PutUint16(resp[6:8], 0)
-	resp[8] = 64 // TTL
-	resp[9] = 17 // UDP
+	resp[8] = 64              // TTL
+	resp[9] = 17              // UDP
 	copy(resp[12:16], dstIP)  // src = the resolver
 	copy(resp[16:20], srcIP)  // dst = the querying host
 	resp[10], resp[11] = 0, 0 // checksum recomputed below
@@ -231,6 +259,7 @@ func (c *TUNClient) SetSystemDNS(addr string) error {
 		return fmt.Errorf("setdnsservers %s: %w (%s)", service, err, strings.TrimSpace(string(out)))
 	}
 	c.dnsSet = true
+	recordDNSState(service, c.savedDNS)
 	c.protectIP(addr)
 	utils.Debugf("[DNS] system resolver on %q set to %s (was %v)", service, addr, c.savedDNS)
 	return nil
@@ -252,6 +281,7 @@ func (c *TUNClient) RestoreSystemDNS() {
 	} else {
 		utils.Debugf("[DNS] system resolver on %q restored to %v", c.dnsService, c.savedDNS)
 	}
+	clearDNSState()
 	c.dnsSet = false
 }
 
@@ -263,8 +293,20 @@ func primaryNetworkService(device string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("listnetworkserviceorder: %w", err)
 	}
+	if name := parseNetworkService(string(out), device); name != "" {
+		return name, nil
+	}
+	return primaryServiceFallback(device)
+}
+
+// parseNetworkService maps a BSD device to its service name using the output
+// of `networksetup -listnetworkserviceorder`. Returns "" when unmatched.
+func parseNetworkService(listOutput, device string) string {
+	if device == "" {
+		return ""
+	}
 	var current string
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(listOutput, "\n") {
 		line = strings.TrimSpace(line)
 		// "(1) Wi-Fi"
 		if strings.HasPrefix(line, "(") && !strings.HasPrefix(line, "(Hardware Port:") {
@@ -274,13 +316,57 @@ func primaryNetworkService(device string) (string, error) {
 			continue
 		}
 		// "(Hardware Port: Wi-Fi, Device: en0)"
-		if strings.HasPrefix(line, "(Hardware Port:") && device != "" {
+		if strings.HasPrefix(line, "(Hardware Port:") {
 			if strings.HasSuffix(strings.TrimSuffix(line, ")"), "Device: "+device) && current != "" {
-				return current, nil
+				return current
+			}
+		}
+	}
+	return ""
+}
+
+// primaryServiceFallback picks the first service that actually has an IPv4
+// address, for when the device could not be matched — the default may run over
+// another VPN's utun, which is not a network service at all.
+func primaryServiceFallback(device string) (string, error) {
+	// Documented fallback: the device could not be matched (for example the
+	// default already runs over another VPN's utun, which is not a service),
+	// so use the first service that actually has an IPv4 address.
+	for _, name := range listNetworkServices() {
+		out, err := exec.Command("networksetup", "-getinfo", name).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "IP address:") {
+				continue
+			}
+			ip := strings.TrimSpace(strings.TrimPrefix(line, "IP address:"))
+			if net.ParseIP(ip) != nil {
+				return name, nil
 			}
 		}
 	}
 	return "", fmt.Errorf("no network service found for device %q", device)
+}
+
+// listNetworkServices returns the enabled service names, in order.
+func listNetworkServices() []string {
+	out, err := exec.Command("networksetup", "-listallnetworkservices").Output()
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for i, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		// The first line is a header; a leading "*" marks a disabled service.
+		if i == 0 || line == "" || strings.HasPrefix(line, "*") {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names
 }
 
 // ---- keeping our own lookups off the tunnel ----------------------------
@@ -293,9 +379,15 @@ func currentResolvers() []string {
 	if err != nil {
 		return nil
 	}
+	return parseResolvers(string(out))
+}
+
+// parseResolvers pulls the distinct nameserver addresses out of scutil's
+// output, in order. Split from the command so it can be tested directly.
+func parseResolvers(scutilOutput string) []string {
 	seen := make(map[string]bool)
 	var servers []string
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(scutilOutput, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "nameserver[") {
 			continue
@@ -360,4 +452,87 @@ func (c *TUNClient) isolateProcessResolver(servers []string) {
 		},
 	}
 	utils.Debugf("[DNS] process resolver pinned to %v (outside the tunnel)", servers)
+}
+
+// ---- surviving a crash -------------------------------------------------
+
+// dnsStatePath records the resolver change across processes. Unlike routes,
+// which the kernel reclaims when utun dies, a resolver setting survives
+// SIGKILL: without this the machine would be left pointing at a resolver that
+// only answers through a tunnel that no longer exists, i.e. with no DNS at all.
+// A variable so tests can redirect it.
+var dnsStatePath = "/var/run/openflux-dns-state"
+
+// recordDNSState stores the service we changed and what it pointed at before.
+// First line is the service name; the rest are the previous servers, if any.
+func recordDNSState(service string, previous []string) {
+	body := append([]string{service}, previous...)
+	if err := os.WriteFile(dnsStatePath, []byte(strings.Join(body, "\n")+"\n"), 0600); err != nil {
+		utils.Debugf("[DNS] cannot record resolver state: %v", err)
+	}
+}
+
+// clearDNSState forgets the record once the resolver has been put back.
+func clearDNSState() { os.Remove(dnsStatePath) }
+
+// dnsState is a resolver change recorded on disk by a previous run.
+type dnsState struct {
+	service  string
+	previous []string
+}
+
+// readDNSState returns the recorded change, if any is on record and usable.
+func readDNSState() (dnsState, bool) {
+	data, err := os.ReadFile(dnsStatePath)
+	if err != nil {
+		return dnsState{}, false
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	service := ""
+	if len(lines) > 0 {
+		service = strings.TrimSpace(lines[0])
+	}
+	if service == "" {
+		return dnsState{}, false
+	}
+	return dnsState{service: service, previous: trimmedNonEmpty(lines[1:])}, true
+}
+
+// restoreDNSArgs builds the networksetup invocation that puts a recorded
+// resolver setting back. "Empty" returns the service to DHCP-provided servers.
+func restoreDNSArgs(st dnsState) []string {
+	args := []string{"networksetup", "-setdnsservers", st.service}
+	if len(st.previous) > 0 {
+		return append(args, st.previous...)
+	}
+	return append(args, "Empty")
+}
+
+// restoreRecordedDNS undoes a resolver change left behind by a crashed run.
+// Called at startup, before we touch anything ourselves.
+func restoreRecordedDNS() {
+	st, ok := readDNSState()
+	if !ok {
+		clearDNSState()
+		return
+	}
+	service := st.service
+	args := restoreDNSArgs(st)
+	if out, err := exec.Command("sudo", args...).CombinedOutput(); err != nil {
+		utils.Debugf("[DNS] crash restore failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		return
+	}
+	utils.Debugf("[DNS] restored resolver on %q left over by a previous run", service)
+	clearDNSState()
+}
+
+// trimmedNonEmpty cleans a slice of lines for use as command arguments.
+func trimmedNonEmpty(lines []string) []string {
+	var out []string
+	for _, l := range lines {
+		if v := strings.TrimSpace(l); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

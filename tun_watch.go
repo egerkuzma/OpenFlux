@@ -102,8 +102,8 @@ func (w *SocketWatcher) removeRoutes() {
 
 	for _, ip := range ips {
 		deleteBypassRoute(ip)
+		forgetBypassRoute(ip)
 	}
-	clearRecordedBypassRoutes()
 	if len(ips) > 0 {
 		utils.Debugf("[WATCH] removed %d bypass route(s)", len(ips))
 	}
@@ -188,8 +188,11 @@ func (w *SocketWatcher) addRoute(ip string) error {
 		"-gateway", w.gateway).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "File exists") {
-			// Ours from an earlier pass: still record it so it gets removed.
-			recordBypassRoute(ip)
+			// Something already routes this address. It may be ours from an
+			// earlier pass, but it may equally be the operator's own route, and
+			// we cannot tell the two apart — so leave it alone rather than
+			// adopt it and delete someone else's route on the way out.
+			utils.Debugf("[WATCH] %s already routed, leaving it as is", ip)
 			return nil
 		}
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))

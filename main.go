@@ -426,24 +426,29 @@ func runClientTUN(trans transport.Transport, dnsServer string) {
 	}
 	log.Printf("utun up; bypass gateway is %s", tc.Gateway())
 
-	// Point the OS at the requested resolver. Its UDP queries reach utun,
-	// where the client turns them into DNS-over-TCP through the tunnel; the
-	// previous setting is restored by tc.Close().
-	if dnsServer != "" {
-		if err := tc.SetSystemDNS(dnsServer); err != nil {
-			log.Printf("warning: could not set system DNS to %s: %v", dnsServer, err)
-		} else {
-			log.Printf("system DNS set to %s (restored on exit)", dnsServer)
-		}
-	}
-
 	watcher := NewSocketWatcher(tc.Gateway(), func() {
 		log.Printf("Socket set stable; taking default route into the tunnel")
 		if err := tc.ConfigureDefault(); err != nil {
-			log.Printf("FATAL: configure default: %v", err)
-			return
+			// Half-configured is the worst outcome: utun is up but carries
+			// nothing, and staying alive would strand the machine there. Undo
+			// and exit so the supervisor sees a failure.
+			log.Printf("configure default route: %v", err)
+			tc.Close()
+			tc.RestoreDefault()
+			os.Exit(1)
 		}
 		tc.Start()
+
+		// Only now, with the tunnel actually carrying traffic, repoint the
+		// resolver. Doing it earlier would aim the OS at a resolver reachable
+		// only through a tunnel that is not up yet.
+		if dnsServer != "" {
+			if err := tc.SetSystemDNS(dnsServer); err != nil {
+				log.Printf("warning: could not set system DNS to %s: %v", dnsServer, err)
+			} else {
+				log.Printf("system DNS set to %s (restored on exit)", dnsServer)
+			}
+		}
 		log.Printf("Tunnel active")
 	})
 	watcher.SetProtected(tc.IsProtected)

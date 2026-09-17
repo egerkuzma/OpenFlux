@@ -150,14 +150,33 @@ final class LogStore {
 // MARK: - Tunnel controller (process lifecycle)
 
 final class TunnelController {
-    private(set) var state: TunnelState = .disconnected
-    private var proc: Process?
-    private var requestedStop = false
     let log = LogStore()
     var onState: ((TunnelState) -> Void)?
 
+    // The child process, the stop flag and the state are touched from the
+    // launching thread, the pipe's reader thread, the termination handler and
+    // the stop worker. One lock covers all three rather than leaving them to
+    // race.
+    private let lock = NSLock()
+    private var _state: TunnelState = .disconnected
+    private var _proc: Process?
+    private var _requestedStop = false
+
+    var state: TunnelState {
+        lock.lock(); defer { lock.unlock() }
+        return _state
+    }
+    private var proc: Process? {
+        get { lock.lock(); defer { lock.unlock() }; return _proc }
+        set { lock.lock(); _proc = newValue; lock.unlock() }
+    }
+    private var requestedStop: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _requestedStop }
+        set { lock.lock(); _requestedStop = newValue; lock.unlock() }
+    }
+
     private func setState(_ s: TunnelState) {
-        state = s
+        lock.lock(); _state = s; lock.unlock()
         DispatchQueue.main.async { self.onState?(s) }
     }
 
@@ -231,6 +250,13 @@ final class TunnelController {
         }
     }
 
+    /// Runs one of the two commands the sudoers rule allows, as root.
+    ///
+    /// The stop uses `pkill -f <binary path>`, which also matches the `sudo`
+    /// wrapper and would match a second tunnel started outside this app. Both
+    /// are acceptable here — the wrapper is the process we want gone anyway,
+    /// and the rule in /etc/sudoers.d/openflux pins these exact arguments, so
+    /// narrowing the match would mean widening the sudo grant.
     @discardableResult
     private func runSudo(_ argv: [String]) -> Int32 {
         let p = Process()

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,8 +17,6 @@ import (
 	"openflux/transport"
 	"openflux/utils"
 )
-
-
 
 // TUNClient is a macOS utun-based L3 forwarder: no gVisor, no SOCKS5.
 // IP packets flow straight between the system utun interface and the transport.
@@ -56,10 +55,10 @@ func NewTUNClient(trans transport.Transport, mtu int) (*TUNClient, error) {
 	}
 
 	c := &TUNClient{
-		trans:    trans,
-		fd:       fd,
-		name:     name,
-		inbound:  make(chan []byte, 4096),
+		trans:   trans,
+		fd:      fd,
+		name:    name,
+		inbound: make(chan []byte, 4096),
 	}
 	return c, nil
 }
@@ -205,14 +204,28 @@ func (c *TUNClient) readFromTun() {
 }
 
 func (c *TUNClient) writeToTun() {
+	// One packet the kernel refuses — an oversized datagram, say — must not
+	// take the whole inbound path down with it, which is what returning on the
+	// first error used to do: every later packet was silently dropped and the
+	// tunnel looked alive while carrying nothing. Skip the offender instead,
+	// and only give up once writing fails persistently, which means the
+	// interface is really gone.
+	const maxConsecutiveWriteErrors = 16
+	failures := 0
 	for pkt := range c.inbound {
 		out := make([]byte, 4+len(pkt))
 		out[3] = 2 // AF_INET
 		copy(out[4:], pkt)
 		if _, err := c.fd.Write(out); err != nil {
-			utils.Debugf("[TUN] write: %v", err)
-			return
+			failures++
+			utils.Debugf("[TUN] write failed (%d in a row, %d bytes): %v", failures, len(pkt), err)
+			if failures >= maxConsecutiveWriteErrors {
+				utils.Debugf("[TUN] giving up on the write loop")
+				return
+			}
+			continue
 		}
+		failures = 0
 		c.packetsIn.Add(1)
 	}
 }
@@ -226,6 +239,7 @@ func (c *TUNClient) Close() error {
 	exec.Command("sudo", "ifconfig", c.name, "down").Run()
 	return c.fd.Close()
 }
+
 // openUtun creates a new utun interface via the PF_SYSTEM control socket.
 func openUtun() (*os.File, string, error) {
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, 2 /* SYSPROTO_CONTROL */)
@@ -261,10 +275,8 @@ func openUtun() (*os.File, string, error) {
 	return os.NewFile(uintptr(fd), name), name, nil
 }
 
-
 // Silence unused import when building only on darwin.
 var _ = net.IPv4len
-
 
 // realGateway returns the default router IP and the interface it is on.
 // It handles macOS's habit of reporting "link#N" instead of an IP address:
@@ -302,7 +314,6 @@ func realGateway() (string, string, error) {
 	return "", "", fmt.Errorf("no physical interface with IPv4 found")
 }
 
-
 // parseIfconfigIPv4 extracts the first inet + netmask from ifconfig output.
 // Handles macOS's hex netmask form (0xffffff00).
 func parseIfconfigIPv4(s string) (net.IP, net.IPMask) {
@@ -336,11 +347,13 @@ func parseIfconfigIPv4(s string) (net.IP, net.IPMask) {
 // parseMask accepts both dotted-quad (255.255.255.0) and hex (0xffffff00).
 func parseMask(s string) net.IPMask {
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		var m uint32
-		if _, err := fmt.Sscanf(s, "0x%x", &m); err == nil {
-			return net.IPv4Mask(byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
+		// Parse the digits directly: scanning against a literal "0x" pattern
+		// rejects the uppercase prefix this branch just accepted.
+		m, err := strconv.ParseUint(s[2:], 16, 32)
+		if err != nil {
+			return nil
 		}
-		return nil
+		return net.IPv4Mask(byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
 	}
 	if ip := net.ParseIP(s).To4(); ip != nil {
 		return net.IPMask(ip)
@@ -365,7 +378,6 @@ func firstUsableHost(ip net.IP, mask net.IPMask) string {
 	return network.String()
 }
 
-
 // Gateway returns the physical gateway IP resolved at SetupInterface time.
 func (c *TUNClient) Gateway() string { return c.gateway }
 
@@ -373,7 +385,6 @@ func (c *TUNClient) Gateway() string { return c.gateway }
 // physical gateway. It does NOT touch the default route.
 
 // ConfigureDefault installs 0.0.0.0/1 and 128.0.0.0/1 through utun.
-
 
 // SaveDefault records the current default route (interface + gateway) so we
 // can restore it on exit. Must be called BEFORE any tunnel routes are
@@ -414,6 +425,8 @@ func (c *TUNClient) SetupInterface() error {
 	exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1").Run()
 	c.purgeStaleHostRoutes()
+	// A resolver change outlives SIGKILL, so undo one a crashed run left.
+	restoreRecordedDNS()
 
 	for _, args := range [][]string{
 		{"ifconfig", c.name, "10.10.10.2", "10.10.10.2", "up"},
