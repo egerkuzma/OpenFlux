@@ -99,6 +99,10 @@ func main() {
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
+	dnsServer := flag.String("dns", "",
+		"Resolver to use while the tun client is up (macOS, --inbound=tun). Its UDP "+
+			"queries are re-issued as DNS-over-TCP through the tunnel, so a resolver "+
+			"living behind the exit node works. The previous setting is restored on exit")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
@@ -145,6 +149,8 @@ INBOUND  (only with --role=client)
   -i, --inbound=tun            utun (macOS) / NEPacketTunnel (iOS). Default on macOS.
   -i, --inbound=socks5         SOCKS5 + gVisor. Default on other platforms.
   -s, --socks5=<addr>          SOCKS5 listen address (default :1080).
+      --dns=<ip>               Resolver for --inbound=tun (macOS). UDP queries are
+                               re-issued as DNS-over-TCP through the tunnel.
 
 MODE  (only with --role=exit)
   -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default.
@@ -353,7 +359,7 @@ DEPRECATED (removed in v2)
 	case roleExit:
 		runExit(trans, exitMode)
 	case roleClient:
-		runClient(trans, *inbound, *socksAddr, exitMode)
+		runClient(trans, *inbound, *socksAddr, *dnsServer, exitMode)
 	default:
 		log.Fatalf("unhandled role %q", *role)
 	}
@@ -387,10 +393,10 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 	select {}
 }
 
-func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tunnel.ExitMode) {
+func runClient(trans transport.Transport, inbound, socksAddr, dnsServer string, exitMode tunnel.ExitMode) {
 	switch inbound {
 	case inboundTUN:
-		runClientTUN(trans)
+		runClientTUN(trans, dnsServer)
 	case inboundSOCKS5:
 		// Explicit opt-in to the legacy SOCKS5+gVisor client. Kept as a fallback
 		// for platforms without a tun client (see README).
@@ -403,7 +409,7 @@ func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tu
 	}
 }
 
-func runClientTUN(trans transport.Transport) {
+func runClientTUN(trans transport.Transport, dnsServer string) {
 	tc, err := NewTUNClient(trans, 1280)
 	if err != nil {
 		log.Fatalf("utun: %v", err)
@@ -420,6 +426,17 @@ func runClientTUN(trans transport.Transport) {
 	}
 	log.Printf("utun up; bypass gateway is %s", tc.Gateway())
 
+	// Point the OS at the requested resolver. Its UDP queries reach utun,
+	// where the client turns them into DNS-over-TCP through the tunnel; the
+	// previous setting is restored by tc.Close().
+	if dnsServer != "" {
+		if err := tc.SetSystemDNS(dnsServer); err != nil {
+			log.Printf("warning: could not set system DNS to %s: %v", dnsServer, err)
+		} else {
+			log.Printf("system DNS set to %s (restored on exit)", dnsServer)
+		}
+	}
+
 	watcher := NewSocketWatcher(tc.Gateway(), func() {
 		log.Printf("Socket set stable; taking default route into the tunnel")
 		if err := tc.ConfigureDefault(); err != nil {
@@ -429,6 +446,7 @@ func runClientTUN(trans transport.Transport) {
 		tc.Start()
 		log.Printf("Tunnel active")
 	})
+	watcher.SetProtected(tc.IsProtected)
 	watcher.Start(2 * time.Second)
 
 	sigCh := make(chan os.Signal, 1)

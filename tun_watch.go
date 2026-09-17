@@ -30,6 +30,18 @@ type SocketWatcher struct {
 	stableAt time.Time
 	onStable func()
 	fired    bool
+
+	// isProtected reports addresses that must keep going through the tunnel
+	// (e.g. a DNS resolver behind the exit node) and so must never get a
+	// /32 route via the physical gateway.
+	isProtected func(string) bool
+}
+
+// SetProtected installs the predicate guarding addresses from being bypassed.
+func (w *SocketWatcher) SetProtected(fn func(string) bool) {
+	w.mu.Lock()
+	w.isProtected = fn
+	w.mu.Unlock()
 }
 
 func NewSocketWatcher(gateway string, onStable func()) *SocketWatcher {
@@ -69,6 +81,32 @@ func (w *SocketWatcher) Stop() {
 	}
 	close(w.stop)
 	w.stopped.Wait()
+	w.removeRoutes()
+}
+
+// removeRoutes deletes every /32 bypass route this watcher installed.
+//
+// These are NOT cleaned up by the kernel: unlike the default overrides, which
+// are bound to utun and vanish with it, a bypass route points at the physical
+// gateway and outlives the process. Leaving them behind blackholes the
+// transport's own backend as soon as the machine moves to another network,
+// where that gateway no longer exists.
+func (w *SocketWatcher) removeRoutes() {
+	w.mu.Lock()
+	ips := make([]string, 0, len(w.known))
+	for ip := range w.known {
+		ips = append(ips, ip)
+	}
+	w.known = make(map[string]bool)
+	w.mu.Unlock()
+
+	for _, ip := range ips {
+		deleteBypassRoute(ip)
+	}
+	clearRecordedBypassRoutes()
+	if len(ips) > 0 {
+		utils.Debugf("[WATCH] removed %d bypass route(s)", len(ips))
+	}
 }
 
 func (w *SocketWatcher) snapshot() {
@@ -102,6 +140,11 @@ func (w *SocketWatcher) snapshot() {
 	w.mu.Lock()
 	for ip := range current {
 		if w.known[ip] {
+			continue
+		}
+		// Never bypass an address that has to stay inside the tunnel.
+		if w.isProtected != nil && w.isProtected(ip) {
+			utils.Debugf("[WATCH] %s is protected, keeping it in the tunnel", ip)
 			continue
 		}
 		if err := w.addRoute(ip); err != nil {
@@ -145,9 +188,12 @@ func (w *SocketWatcher) addRoute(ip string) error {
 		"-gateway", w.gateway).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "File exists") {
+			// Ours from an earlier pass: still record it so it gets removed.
+			recordBypassRoute(ip)
 			return nil
 		}
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
+	recordBypassRoute(ip)
 	return nil
 }

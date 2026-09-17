@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
+
 	"golang.org/x/sys/unix"
 
 	"openflux/transport"
@@ -37,6 +39,14 @@ type TUNClient struct {
 	savedIface string
 	savedGw    string
 	defaultSet bool
+
+	// DNS interception state: addresses that must never be bypassed around
+	// the tunnel, plus the system resolver setting we replaced (if any).
+	protectedMu sync.Mutex
+	protected   map[string]bool
+	dnsService  string
+	savedDNS    []string
+	dnsSet      bool
 }
 
 func NewTUNClient(trans transport.Transport, mtu int) (*TUNClient, error) {
@@ -176,6 +186,13 @@ func (c *TUNClient) readFromTun() {
 			utils.Debugf("[TUN] not IPv4, skipping (%d bytes)", len(pkt))
 			continue
 		}
+		// The tunnel carries TCP only, so a UDP DNS query would be lost.
+		// Re-issue it as DNS-over-TCP to the same resolver instead, and
+		// inject the answer back as UDP (see tun_dns_darwin.go).
+		if ihl, ok := isDNSQuery(pkt); ok {
+			go c.handleDNSQuery(pkt, ihl)
+			continue
+		}
 		c.packetsOut.Add(1)
 		utils.Debugf("[TUN] -> %d bytes proto=%d %d.%d.%d.%d -> %d.%d.%d.%d",
 			len(pkt), pkt[9],
@@ -201,7 +218,11 @@ func (c *TUNClient) writeToTun() {
 }
 
 func (c *TUNClient) Close() error {
+	c.RestoreSystemDNS()
 	c.removeRoutes()
+	// Safety net: drop any bypass route still on record (e.g. if the watcher
+	// was never stopped), so none outlives the tunnel.
+	c.purgeStaleHostRoutes()
 	exec.Command("sudo", "ifconfig", c.name, "down").Run()
 	return c.fd.Close()
 }
@@ -387,9 +408,12 @@ func (c *TUNClient) SaveDefault() error {
 // previous crashed run, and resolves the physical gateway used for bypass
 // routes. It does NOT install the default route.
 func (c *TUNClient) SetupInterface() error {
-	// Purge leftover default-override routes from a previous run.
+	// Purge leftovers from a previous run: the default overrides, and the
+	// /32 bypass routes, which the kernel does NOT reclaim because they point
+	// at the physical gateway rather than at utun.
 	exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1").Run()
 	exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1").Run()
+	c.purgeStaleHostRoutes()
 
 	for _, args := range [][]string{
 		{"ifconfig", c.name, "10.10.10.2", "10.10.10.2", "up"},

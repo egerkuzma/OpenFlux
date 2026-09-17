@@ -27,11 +27,16 @@ func (c *TUNClient) SaveDefault() error      { return errTUNUnsupported }
 func (c *TUNClient) RestoreDefault()         {}
 func (c *TUNClient) purgeStaleHostRoutes()   {}
 
+func (c *TUNClient) IsProtected(ip string) bool     { return false }
+func (c *TUNClient) SetSystemDNS(addr string) error { return errTUNUnsupported }
+func (c *TUNClient) RestoreSystemDNS()              {}
+
 type SocketWatcher struct{}
 
 func NewSocketWatcher(gateway string, onStable func()) *SocketWatcher {
 	return &SocketWatcher{}
 }
 
-func (w *SocketWatcher) Start(interval time.Duration) {}
-func (w *SocketWatcher) Stop()                        {}
+func (w *SocketWatcher) Start(interval time.Duration)      {}
+func (w *SocketWatcher) Stop()                             {}
+func (w *SocketWatcher) SetProtected(fn func(string) bool) {}
