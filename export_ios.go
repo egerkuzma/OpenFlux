@@ -20,6 +20,7 @@ import (
 
 	"openflux/socks5"
 	"openflux/transport"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/tunnel"
@@ -163,14 +164,19 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	}
 	probe.Close()
 
+	// Codec must match the exit node's --codec (default: batched).
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		t = transport.NewBatchedTransport(yandex.NewYandexDocsTransport(docURL, config))
+	case "vyandex":
+		t = transport.NewBatchedTransport(yandex.NewYandexVolgaTransport(docURL, config))
+	case "mailru":
+		t = transport.NewBatchedTransport(mailru.NewMailruDocsTransport(docURL, config))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		t = transport.NewBatchedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)

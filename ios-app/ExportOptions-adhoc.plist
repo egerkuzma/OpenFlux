@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Ad-hoc distribution: signs the IPA for pre-registered device UDIDs.
+         Requires a PAID Apple Developer account (your own, or the author's team
+         with your Apple ID invited). Replace teamID with your team. Register
+         each tester device's UDID in the account first, or automatic signing
+         will fail to produce an ad-hoc profile. -->
+    <key>method</key>
+    <string>ad-hoc</string>
+    <key>destination</key>
+    <string>export</string>
+    <key>teamID</key>
+    <string>REPLACE_WITH_YOUR_TEAM_ID</string>
+    <key>signingStyle</key>
+    <string>automatic</string>
+    <key>uploadSymbols</key>
+    <true/>
+    <key>compileBitcode</key>
+    <false/>
+    <!-- Uncomment to emit an OTA install manifest (itms-services) alongside the
+         IPA; set your HTTPS URL where the .ipa will be hosted.
+    <key>manifest</key>
+    <dict>
+        <key>appURL</key><string>https://YOUR_HOST/OpenFlux.ipa</string>
+        <key>displayImageURL</key><string>https://YOUR_HOST/icon57.png</string>
+        <key>fullSizeImageURL</key><string>https://YOUR_HOST/icon512.png</string>
+    </dict>
+    -->
+</dict>
+</plist>

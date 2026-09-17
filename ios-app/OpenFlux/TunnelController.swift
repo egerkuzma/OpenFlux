@@ -4,11 +4,13 @@ import Combine
 enum TransportKind: String, CaseIterable, Identifiable {
     case yandex = "yandex"
     case max = "oneme"
+    case mailru = "mailru"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .yandex: return "Yandex Docs"
         case .max: return "MAX"
+        case .mailru: return "Mail.ru Cloud"
         }
     }
 }

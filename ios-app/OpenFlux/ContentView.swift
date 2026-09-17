@@ -20,8 +20,8 @@ struct ContentView: View {
     private var canStart: Bool {
         guard (Int(socksPort) ?? 0) > 0 else { return false }
         switch transport {
-        case .yandex: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
-        case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
+        case .yandex, .mailru: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .max:             return !maxToken.isEmpty && !maxUid.isEmpty
         }
     }
 
@@ -71,6 +71,10 @@ struct ContentView: View {
         case .yandex:
             field(title: "Yandex Docs URL",
                   placeholder: "https://docs.yandex.ru/docs/view?url=...",
+                  text: $docURL)
+        case .mailru:
+            field(title: "Cloud.mail.ru public URL",
+                  placeholder: "https://cloud.mail.ru/public/XXXX/YYYY",
                   text: $docURL)
         case .max:
             field(title: "MAX token", placeholder: "auth token", text: $maxToken)

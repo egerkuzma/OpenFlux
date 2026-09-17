@@ -21,6 +21,7 @@ import (
 
 	"openflux/network"
 	"openflux/transport"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/utils"
@@ -72,14 +73,20 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	debug.SetMemoryLimit(40 << 20)
 	debug.SetGCPercent(20)
 
+	// Codec must match the exit node's --codec (default: batched). Encryption
+	// is not applied here: run the node without --encryption-key-file to match.
 	config := transport.DefaultConfig()
 	var t transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		t = transport.NewBatchedTransport(yandex.NewYandexDocsTransport(docURL, config))
+	case "vyandex":
+		t = transport.NewBatchedTransport(yandex.NewYandexVolgaTransport(docURL, config))
+	case "mailru":
+		t = transport.NewBatchedTransport(mailru.NewMailruDocsTransport(docURL, config))
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		t = transport.NewBatchedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
 	default:
 		return C.int(startBadTransport)
 	}
