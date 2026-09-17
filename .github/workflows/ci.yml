@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The client that actually runs on a Mac: utun, route handling and the DNS
+  # interception all sit behind //go:build darwin, so their tests only compile
+  # and run here.
+  macos:
+    name: macOS — vet, test, build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        # tunnel/tunnel.go carries a long-standing IPv6 formatting warning that
+        # predates this workflow; fail on anything else.
+        run: |
+          go vet ./... 2>&1 | tee vet.log || true
+          if grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log | grep -q ':'; then
+            echo "go vet reported new problems:"
+            grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log
+            exit 1
+          fi
+
+      - name: go test (race + coverage)
+        run: go test ./... -race -covermode=atomic -coverprofile=coverage.out -timeout 5m
+
+      - name: Coverage of the macOS client
+        run: |
+          go tool cover -func=coverage.out | grep -E 'tun_(dns|routes|watch|darwin)' || true
+          go tool cover -func=coverage.out | tail -1
+
+      - name: Build the tunnel binary
+        run: go build -o /dev/null .
+
+      - name: Build the menu-bar app
+        run: |
+          swiftc -O -o /dev/null macos-app/OpenFluxMenu.swift \
+            -framework AppKit -framework Foundation
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  # The exit node runs on Linux, and the non-darwin stubs must keep compiling:
+  # a change to the darwin client that forgets to update them would otherwise
+  # only break when someone builds the node.
+  linux:
+    name: Linux — vet and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: |
+          go vet ./... 2>&1 | tee vet.log || true
+          if grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log | grep -q ':'; then
+            echo "go vet reported new problems:"
+            grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./... -timeout 5m
+
+      - name: gofmt
+        # Only the files this fork maintains. Several upstream files have never
+        # been gofmt-clean, and reformatting code we do not own would bury real
+        # changes in noise.
+        run: |
+          files="main.go tun_darwin.go tun_dns_darwin.go tun_routes_darwin.go \
+                 tun_watch.go tun_other.go export_ios.go \
+                 tun_darwin_test.go tun_dns_darwin_test.go \
+                 tun_routes_darwin_test.go tun_watch_test.go"
+          unformatted="$(gofmt -l $files || true)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
