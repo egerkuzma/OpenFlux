@@ -1,53 +1,92 @@
 // OpenFluxMenu — menu-bar controller for the OpenFlux macOS tun client.
 // Compiled with swiftc (no Xcode) and packaged into OpenFlux.app by build.sh.
 // It launches /usr/local/bin/openflux under passwordless sudo, shows status and
-// the external IP, streams the log, and exposes settings (transport / URL / key).
+// the external IP, streams the log, and keeps a set of connection profiles.
 // Route cleanup on stop and on crash is done by openflux / the kernel.
 
 import AppKit
 import Foundation
 
-// MARK: - Configuration (persisted in UserDefaults)
+// MARK: - Profile
 
-struct Config {
-    var binary    = "/usr/local/bin/openflux"
+/// One saved connection: a transport plus everything that transport needs.
+/// Several may exist side by side (say a Mail.ru one and a Yandex one); the
+/// menu picks which is used.
+struct Profile: Codable {
+    var id = UUID()
+    var name = "Новый профиль"
     // No defaults for the document URL or the key: they identify a specific
-    // tunnel and belong to the operator, not to the source tree. Both are set
-    // in Settings and persist in UserDefaults.
-    var url       = ""
+    // tunnel and belong to the operator, not to the source tree.
     var transport = "mailru"
-    var keyFile   = ""
-    var dns       = ""
-    var maxToken  = ""
-    var maxUid    = ""
-    var debug     = false
+    var url = ""
+    var keyFile = ""
+    var dns = ""
+    var maxToken = ""
+    var maxUid = ""
+    var debug = false
 
     static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "oneme"]
 
-    static func load() -> Config {
-        var c = Config()
+    /// A profile is usable once its transport has what it needs: oneme is
+    /// driven by credentials, everything else by a document URL.
+    var isComplete: Bool {
+        transport == "oneme"
+            ? !maxToken.trimmingCharacters(in: .whitespaces).isEmpty
+            : !url.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+}
+
+/// The whole persisted state: the profiles and which one is selected.
+struct Store: Codable {
+    var profiles: [Profile] = []
+    var selected: UUID?
+
+    static let key = "store"
+    private static let binary = "/usr/local/bin/openflux"
+
+    var active: Profile? {
+        if let id = selected, let p = profiles.first(where: { $0.id == id }) { return p }
+        return profiles.first
+    }
+
+    static func load() -> Store {
         let d = UserDefaults.standard
-        if let v = d.string(forKey: "binary")    { c.binary = v }
-        if let v = d.string(forKey: "url")        { c.url = v }
-        if let v = d.string(forKey: "transport")  { c.transport = v }
-        if let v = d.string(forKey: "keyFile")    { c.keyFile = v }
-        if let v = d.string(forKey: "dns")         { c.dns = v }
-        if let v = d.string(forKey: "maxToken")   { c.maxToken = v }
-        if let v = d.string(forKey: "maxUid")     { c.maxUid = v }
-        if d.object(forKey: "debug") != nil       { c.debug = d.bool(forKey: "debug") }
-        return c
+        if let data = d.data(forKey: key),
+           let s = try? JSONDecoder().decode(Store.self, from: data), !s.profiles.isEmpty {
+            return s
+        }
+        return migrateLegacy()
     }
 
     func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Store.key)
+        }
+    }
+
+    /// Earlier builds kept a single flat configuration. Fold it into one
+    /// profile so an upgrade never loses a working setup.
+    private static func migrateLegacy() -> Store {
         let d = UserDefaults.standard
-        d.set(binary, forKey: "binary")
-        d.set(url, forKey: "url")
-        d.set(transport, forKey: "transport")
-        d.set(keyFile, forKey: "keyFile")
-        d.set(dns, forKey: "dns")
-        d.set(maxToken, forKey: "maxToken")
-        d.set(maxUid, forKey: "maxUid")
-        d.set(debug, forKey: "debug")
+        var p = Profile()
+        p.name = "Основной"
+        if let v = d.string(forKey: "transport"), !v.isEmpty { p.transport = v }
+        if let v = d.string(forKey: "url") { p.url = v }
+        if let v = d.string(forKey: "keyFile") { p.keyFile = v }
+        if let v = d.string(forKey: "dns") { p.dns = v }
+        if let v = d.string(forKey: "maxToken") { p.maxToken = v }
+        if let v = d.string(forKey: "maxUid") { p.maxUid = v }
+        p.debug = d.bool(forKey: "debug")
+
+        let s = Store(profiles: [p], selected: p.id)
+        s.save()
+        return s
+    }
+
+    /// Path of the tunnel binary. Kept out of the profile: it is a property of
+    /// the installation, not of a connection.
+    static var binaryPath: String {
+        UserDefaults.standard.string(forKey: "binary") ?? binary
     }
 }
 
@@ -122,35 +161,35 @@ final class TunnelController {
         DispatchQueue.main.async { self.onState?(s) }
     }
 
-    func connect(_ cfg: Config) {
+    func connect(_ p: Profile) {
         guard state == .disconnected else { return }
         requestedStop = false
         setState(.connecting)
-        log.startSession(header: "connect \(cfg.transport) \(Date())")
+        log.startSession(header: "connect \(p.name) [\(p.transport)] \(Date())")
 
-        var args = ["-n", cfg.binary,
+        var args = ["-n", Store.binaryPath,
                     "--role=client", "--inbound=tun",
-                    "--transport=\(cfg.transport)",
-                    "--url=\(cfg.url)"]
+                    "--transport=\(p.transport)",
+                    "--url=\(p.url)"]
         // Encryption is optional: an empty key file means the flag is omitted,
         // so the transport runs unencrypted. The node must match (also keyless).
-        let key = cfg.keyFile.trimmingCharacters(in: .whitespaces)
-        if !key.isEmpty          { args.append("--encryption-key-file=\(key)") }
+        let key = p.keyFile.trimmingCharacters(in: .whitespaces)
+        if !key.isEmpty { args.append("--encryption-key-file=\(key)") }
         // A resolver behind the exit node: the client turns the OS's UDP
         // queries into DNS-over-TCP through the tunnel and restores the
         // previous system resolver when it stops.
-        let dns = cfg.dns.trimmingCharacters(in: .whitespaces)
-        if !dns.isEmpty          { args.append("--dns=\(dns)") }
-        if !cfg.maxToken.isEmpty { args.append("--maxToken=\(cfg.maxToken)") }
-        if !cfg.maxUid.isEmpty   { args.append("--maxUid=\(cfg.maxUid)") }
-        if cfg.debug             { args.append("--debug") }
+        let dns = p.dns.trimmingCharacters(in: .whitespaces)
+        if !dns.isEmpty { args.append("--dns=\(dns)") }
+        if !p.maxToken.isEmpty { args.append("--maxToken=\(p.maxToken)") }
+        if !p.maxUid.isEmpty { args.append("--maxUid=\(p.maxUid)") }
+        if p.debug { args.append("--debug") }
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        p.arguments = args
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        proc.arguments = args
         let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
+        proc.standardOutput = pipe
+        proc.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
             guard let self = self, !d.isEmpty else { return }
@@ -159,19 +198,19 @@ final class TunnelController {
                 self.setState(.connected)
             }
         }
-        p.terminationHandler = { [weak self] proc in
+        proc.terminationHandler = { [weak self] pr in
             guard let self = self else { return }
             pipe.fileHandleForReading.readabilityHandler = nil
-            self.log.append("\n==== openflux exited (code \(proc.terminationStatus)) ====\n".data(using: .utf8)!)
+            self.log.append("\n==== openflux exited (code \(pr.terminationStatus)) ====\n".data(using: .utf8)!)
             self.log.closeSession()
             let wasRequested = self.requestedStop
             self.proc = nil
             self.setState(.disconnected)
             if !wasRequested {
-                DispatchQueue.main.async { self.notifyUnexpected(code: proc.terminationStatus) }
+                DispatchQueue.main.async { self.notifyUnexpected(code: pr.terminationStatus) }
             }
         }
-        do { try p.run(); proc = p }
+        do { try proc.run(); self.proc = proc }
         catch {
             log.append("failed to launch: \(error)\n".data(using: .utf8)!)
             setState(.disconnected)
@@ -183,12 +222,12 @@ final class TunnelController {
         requestedStop = true
         setState(.disconnecting)
         DispatchQueue.global().async {
-            self.runSudo(["pkill", "-TERM", "-f", "/usr/local/bin/openflux"])
+            self.runSudo(["pkill", "-TERM", "-f", Store.binaryPath])
             for _ in 0..<12 {
                 if self.proc == nil { return }
                 usleep(500_000)
             }
-            self.runSudo(["pkill", "-KILL", "-f", "/usr/local/bin/openflux"])
+            self.runSudo(["pkill", "-KILL", "-f", Store.binaryPath])
         }
     }
 
@@ -216,19 +255,26 @@ final class TunnelController {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let ctrl = TunnelController()
-    var cfg = Config.load()
+    var store = Store.load()
 
-    let statusLine = NSMenuItem(title: "Отключено", action: nil, keyEquivalent: "")
-    let ipLine     = NSMenuItem(title: "IP: —", action: nil, keyEquivalent: "")
-    let toggleItem = NSMenuItem(title: "Подключить", action: #selector(toggle), keyEquivalent: "c")
-    let loginItem  = NSMenuItem(title: "Запуск при входе", action: #selector(toggleLogin), keyEquivalent: "")
+    let statusLine   = NSMenuItem(title: "Отключено", action: nil, keyEquivalent: "")
+    let ipLine       = NSMenuItem(title: "IP: —", action: nil, keyEquivalent: "")
+    let profilesItem = NSMenuItem(title: "Профиль", action: nil, keyEquivalent: "")
+    let toggleItem   = NSMenuItem(title: "Подключить", action: #selector(toggle), keyEquivalent: "c")
+    let loginItem    = NSMenuItem(title: "Запуск при входе", action: #selector(toggleLogin), keyEquivalent: "")
 
     var logWindow: NSWindow?
     var logTextView: NSTextView?
+    var logScroll: NSScrollView?
     var logTimer: Timer?
+    /// Last text pushed into the log view, so an unchanged log is not
+    /// re-rendered (re-rendering throws away the user's selection).
+    var lastLogText = ""
 
     // Settings controls
     var settingsWindow: NSWindow?
+    var fProfiles: NSPopUpButton!
+    var fName: NSTextField!
     var fTransport: NSPopUpButton!
     var fURL: NSTextField!
     var fKey: NSTextField!
@@ -236,9 +282,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var fToken: NSTextField!
     var fUid: NSTextField!
     var fDebug: NSButton!
+    /// Profiles being edited; committed to `store` only when Save is pressed.
+    var draft: [Profile] = []
+    var draftIndex = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        buildMainMenu()
         ctrl.onState = { [weak self] s in self?.render(s) }
 
         let menu = NSMenu()
@@ -247,11 +297,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(statusLine)
         menu.addItem(ipLine)
         menu.addItem(.separator())
+        menu.addItem(profilesItem)
+        menu.addItem(.separator())
         toggleItem.target = self
         menu.addItem(toggleItem)
         addItem(menu, "Обновить IP", #selector(refreshIP), "r")
         addItem(menu, "Показать лог", #selector(showLog), "l")
-        addItem(menu, "Настройки…", #selector(showSettings), ",")
+        addItem(menu, "Профили…", #selector(showSettings), ",")
         menu.addItem(.separator())
         loginItem.target = self
         loginItem.state = LoginItem.isEnabled() ? .on : .off
@@ -260,8 +312,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         addItem(menu, "Выход", #selector(quit), "q")
         statusItem.menu = menu
 
+        rebuildProfilesMenu()
         render(.disconnected)
         refreshIP()
+    }
+
+    /// A menu-bar-only app has no menu bar of its own, and macOS routes the
+    /// standard editing shortcuts through menu items. Without an Edit menu
+    /// Cmd+C, Cmd+A and Cmd+V do nothing in our windows — nothing claims them.
+    /// The menu is never displayed; it exists so those key equivalents resolve.
+    private func buildMainMenu() {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let hide = NSMenuItem(title: "Скрыть", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        hide.target = NSApp
+        appMenu.addItem(hide)
+        appMenu.addItem(.separator())
+        let quitMI = NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: "q")
+        quitMI.target = self
+        appMenu.addItem(quitMI)
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Правка")
+        // String selectors: these travel the responder chain to whatever text
+        // control is focused, and avoid Swift's ambiguity around copy(_:).
+        edit.addItem(withTitle: "Отменить", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Повторить", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Вырезать", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Копировать", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Вставить", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Выделить всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        NSApp.mainMenu = main
     }
 
     private func addItem(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String) {
@@ -270,12 +360,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(mi)
     }
 
+    // MARK: profiles menu
+
+    /// Rebuilds the submenu listing every profile, a check mark on the active
+    /// one. Selecting a different profile while connected does not tear the
+    /// tunnel down; it takes effect on the next connect.
+    func rebuildProfilesMenu() {
+        let sub = NSMenu()
+        let activeID = store.active?.id
+        for p in store.profiles {
+            let mi = NSMenuItem(title: p.name.isEmpty ? "(без имени)" : p.name,
+                                action: #selector(selectProfile(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = p.id.uuidString
+            mi.state = (p.id == activeID) ? .on : .off
+            if !p.isComplete { mi.title += " — не настроен" }
+            sub.addItem(mi)
+        }
+        if store.profiles.isEmpty {
+            let mi = NSMenuItem(title: "(нет профилей)", action: nil, keyEquivalent: "")
+            mi.isEnabled = false
+            sub.addItem(mi)
+        }
+        sub.addItem(.separator())
+        let manage = NSMenuItem(title: "Управление профилями…", action: #selector(showSettings), keyEquivalent: "")
+        manage.target = self
+        sub.addItem(manage)
+
+        profilesItem.submenu = sub
+        profilesItem.title = "Профиль: " + (store.active?.name ?? "—")
+    }
+
+    @objc func selectProfile(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let id = UUID(uuidString: raw) else { return }
+        store.selected = id
+        store.save()
+        rebuildProfilesMenu()
+        if ctrl.state == .connected || ctrl.state == .connecting {
+            let a = NSAlert()
+            a.messageText = "Профиль переключён"
+            a.informativeText = "Туннель сейчас активен. Новый профиль будет использован после переподключения."
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+    }
+
     @objc func toggle() {
         switch ctrl.state {
-        case .disconnected: ctrl.connect(cfg)
-        case .connected, .connecting: ctrl.disconnect()
+        case .disconnected:
+            guard let p = store.active else {
+                warn("Нет профиля", "Создайте профиль в «Профили…» и укажите транспорт и ссылку.")
+                return
+            }
+            guard p.isComplete else {
+                warn("Профиль не настроен",
+                     p.transport == "oneme"
+                        ? "Для транспорта oneme нужен maxToken."
+                        : "Укажите ссылку на документ для профиля «\(p.name)».")
+                return
+            }
+            ctrl.connect(p)
+        case .connected, .connecting:
+            ctrl.disconnect()
         default: break
         }
+    }
+
+    private func warn(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.alertStyle = .warning
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
     }
 
     func statusImage(_ s: TunnelState) -> NSImage? {
@@ -321,40 +479,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func showLog() {
         if logWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 420),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 470),
                              styleMask: [.titled, .closable, .resizable],
                              backing: .buffered, defer: false)
             w.title = "OpenFlux — лог"
             w.isReleasedWhenClosed = false
             w.delegate = self
             w.center()
-            let scroll = NSScrollView(frame: w.contentView!.bounds)
+            let content = w.contentView!
+
+            let bar: CGFloat = 44
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: bar,
+                                                   width: content.bounds.width,
+                                                   height: content.bounds.height - bar))
             scroll.autoresizingMask = [.width, .height]
             scroll.hasVerticalScroller = true
             let tv = NSTextView(frame: scroll.bounds)
             tv.isEditable = false
+            tv.isSelectable = true            // selection is what Cmd+C copies
             tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
             tv.autoresizingMask = [.width]
             scroll.documentView = tv
-            w.contentView?.addSubview(scroll)
+            content.addSubview(scroll)
+
+            let copyAll = NSButton(title: "Копировать всё", target: self, action: #selector(copyWholeLog))
+            copyAll.frame = NSRect(x: 12, y: 8, width: 140, height: 28)
+            copyAll.autoresizingMask = [.maxXMargin]
+            content.addSubview(copyAll)
+
+            let copySel = NSButton(title: "Копировать выделенное", target: self, action: #selector(copySelectedLog))
+            copySel.frame = NSRect(x: 160, y: 8, width: 190, height: 28)
+            copySel.autoresizingMask = [.maxXMargin]
+            content.addSubview(copySel)
+
+            let reveal = NSButton(title: "Показать файл", target: self, action: #selector(revealLogFile))
+            reveal.frame = NSRect(x: 358, y: 8, width: 130, height: 28)
+            reveal.autoresizingMask = [.maxXMargin]
+            content.addSubview(reveal)
+
             logWindow = w
             logTextView = tv
+            logScroll = scroll
         }
-        logTextView?.string = ctrl.log.text()
+
+        lastLogText = ctrl.log.text()
+        logTextView?.string = lastLogText
         logTextView?.scrollToEndOfDocument(nil)
+
         logTimer?.invalidate()
         logTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, let w = self.logWindow, w.isVisible else { return }
-            self.logTextView?.string = self.ctrl.log.text()
-            self.logTextView?.scrollToEndOfDocument(nil)
+            self?.refreshLogView()
         }
         NSApp.activate(ignoringOtherApps: true)
         logWindow?.makeKeyAndOrderFront(nil)
     }
 
-    // Stop the log refresh timer when its window closes, so no callback fires
-    // against a hidden window. Windows keep isReleasedWhenClosed = false, so the
-    // references stay valid and reopening is safe.
+    /// Redraws the log without destroying what the user is doing: an unchanged
+    /// log is left alone, a live selection is never clobbered, and the view
+    /// only jumps to the end if it was already there.
+    private func refreshLogView() {
+        guard let w = logWindow, w.isVisible,
+              let tv = logTextView, let scroll = logScroll else { return }
+        if tv.selectedRange().length > 0 { return }
+
+        let text = ctrl.log.text()
+        if text == lastLogText { return }
+        lastLogText = text
+
+        let wasAtBottom: Bool = {
+            guard let doc = scroll.documentView else { return true }
+            return scroll.contentView.bounds.maxY >= doc.bounds.height - 4
+        }()
+        tv.string = text
+        if wasAtBottom { tv.scrollToEndOfDocument(nil) }
+    }
+
+    @objc private func copyWholeLog() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(ctrl.log.text(), forType: .string)
+    }
+
+    @objc private func copySelectedLog() {
+        guard let tv = logTextView else { return }
+        let range = tv.selectedRange()
+        let text = range.length > 0
+            ? (tv.string as NSString).substring(with: range)
+            : ctrl.log.text()
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
+    @objc private func revealLogFile() {
+        NSWorkspace.shared.activateFileViewerSelecting([ctrl.log.fileURL])
+    }
+
+    // Stop the log refresh timer when its window closes. Windows keep
+    // isReleasedWhenClosed = false, so reopening is safe.
     func windowWillClose(_ notification: Notification) {
         if let w = notification.object as? NSWindow, w == logWindow {
             logTimer?.invalidate()
@@ -362,21 +584,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: settings window
+    // MARK: profiles window
 
     @objc func showSettings() {
         if settingsWindow == nil { buildSettingsWindow() }
-        loadSettingsIntoFields()
+        draft = store.profiles
+        if draft.isEmpty { draft = [Profile()] }
+        draftIndex = draft.firstIndex(where: { $0.id == store.active?.id }) ?? 0
+        reloadProfilePopup()
+        loadFields()
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.center()
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 440),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
-        w.title = "OpenFlux — настройки"
+        w.title = "OpenFlux — профили"
         w.isReleasedWhenClosed = false
         w.delegate = self
         let v = w.contentView!
@@ -388,67 +614,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             v.addSubview(l)
         }
         func field(_ y: CGFloat) -> NSTextField {
-            let f = NSTextField(frame: NSRect(x: 134, y: y - 2, width: 330, height: 24))
+            let f = NSTextField(frame: NSRect(x: 132, y: y - 2, width: 364, height: 24))
             v.addSubview(f); return f
         }
 
-        label("Транспорт:", 340)
-        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 336, width: 200, height: 26))
-        fTransport.addItems(withTitles: Config.transports)
-        v.addSubview(fTransport)
+        label("Профиль:", 396)
+        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 392, width: 280, height: 26))
+        fProfiles.target = self
+        fProfiles.action = #selector(switchDraftProfile)
+        v.addSubview(fProfiles)
+        let add = NSButton(title: "+", target: self, action: #selector(addProfile))
+        add.frame = NSRect(x: 420, y: 392, width: 36, height: 26)
+        v.addSubview(add)
+        let del = NSButton(title: "−", target: self, action: #selector(deleteProfile))
+        del.frame = NSRect(x: 460, y: 392, width: 36, height: 26)
+        v.addSubview(del)
 
-        label("Ссылка (URL):", 302); fURL = field(302)
-        label("Файл ключа:", 264);   fKey = field(264)
-        label("DNS-сервер:", 226);   fDNS = field(226)
-        label("maxToken:", 188);     fToken = field(188)
-        label("maxUid:", 150);       fUid = field(150)
+        label("Название:", 356);      fName = field(356)
+        label("Транспорт:", 316)
+        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 312, width: 220, height: 26))
+        fTransport.addItems(withTitles: Profile.transports)
+        v.addSubview(fTransport)
+        label("Ссылка (URL):", 276);  fURL = field(276)
+        label("Файл ключа:", 236);    fKey = field(236)
+        label("DNS-сервер:", 196);    fDNS = field(196)
+        label("maxToken:", 156);      fToken = field(156)
+        label("maxUid:", 116);        fUid = field(116)
 
         fDebug = NSButton(checkboxWithTitle: "Debug-логи (подробный лог)", target: nil, action: nil)
-        fDebug.frame = NSRect(x: 134, y: 112, width: 320, height: 20)
+        fDebug.frame = NSRect(x: 132, y: 84, width: 320, height: 20)
         v.addSubview(fDebug)
 
-        let note = NSTextField(labelWithString: "DNS: пусто = системный. Задан — станет системным на время работы.")
-        note.frame = NSRect(x: 16, y: 68, width: 448, height: 18)
+        let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Какой профиль использовать — галочкой в меню «Профиль».")
+        note.frame = NSRect(x: 16, y: 52, width: 488, height: 18)
         note.textColor = .secondaryLabelColor
         note.font = NSFont.systemFont(ofSize: 11)
         v.addSubview(note)
 
         let save = NSButton(title: "Сохранить", target: self, action: #selector(saveSettings))
-        save.frame = NSRect(x: 366, y: 16, width: 100, height: 32)
+        save.frame = NSRect(x: 396, y: 14, width: 100, height: 32)
         save.keyEquivalent = "\r"
         v.addSubview(save)
         let cancel = NSButton(title: "Отмена", target: self, action: #selector(closeSettings))
-        cancel.frame = NSRect(x: 272, y: 16, width: 88, height: 32)
+        cancel.frame = NSRect(x: 300, y: 14, width: 88, height: 32)
         v.addSubview(cancel)
 
         settingsWindow = w
     }
 
-    private func loadSettingsIntoFields() {
-        fTransport.selectItem(withTitle: cfg.transport)
+    private func reloadProfilePopup() {
+        fProfiles.removeAllItems()
+        for p in draft { fProfiles.addItem(withTitle: p.name.isEmpty ? "(без имени)" : p.name) }
+        if draftIndex < fProfiles.numberOfItems { fProfiles.selectItem(at: draftIndex) }
+    }
+
+    /// Copies the form into the profile being edited, so switching profiles or
+    /// saving never silently drops what was typed.
+    private func commitFields() {
+        guard draft.indices.contains(draftIndex) else { return }
+        draft[draftIndex].name = fName.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].transport = fTransport.titleOfSelectedItem ?? draft[draftIndex].transport
+        draft[draftIndex].url = fURL.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].keyFile = fKey.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].dns = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].maxToken = fToken.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].maxUid = fUid.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].debug = (fDebug.state == .on)
+    }
+
+    private func loadFields() {
+        guard draft.indices.contains(draftIndex) else { return }
+        let p = draft[draftIndex]
+        fName.stringValue = p.name
+        fTransport.selectItem(withTitle: p.transport)
         if fTransport.selectedItem == nil { fTransport.selectItem(at: 0) }
-        fURL.stringValue = cfg.url
-        fKey.stringValue = cfg.keyFile
-        fDNS.stringValue = cfg.dns
-        fToken.stringValue = cfg.maxToken
-        fUid.stringValue = cfg.maxUid
-        fDebug.state = cfg.debug ? .on : .off
+        fURL.stringValue = p.url
+        fKey.stringValue = p.keyFile
+        fDNS.stringValue = p.dns
+        fToken.stringValue = p.maxToken
+        fUid.stringValue = p.maxUid
+        fDebug.state = p.debug ? .on : .off
+    }
+
+    @objc private func switchDraftProfile() {
+        commitFields()
+        draftIndex = fProfiles.indexOfSelectedItem
+        loadFields()
+        reloadProfilePopup()
+    }
+
+    @objc private func addProfile() {
+        commitFields()
+        var p = Profile()
+        p.name = "Профиль \(draft.count + 1)"
+        draft.append(p)
+        draftIndex = draft.count - 1
+        reloadProfilePopup()
+        loadFields()
+    }
+
+    @objc private func deleteProfile() {
+        guard draft.count > 1 else {
+            warn("Нельзя удалить", "Должен остаться хотя бы один профиль.")
+            return
+        }
+        draft.remove(at: draftIndex)
+        draftIndex = max(0, draftIndex - 1)
+        reloadProfilePopup()
+        loadFields()
     }
 
     @objc private func saveSettings() {
-        cfg.transport = fTransport.titleOfSelectedItem ?? cfg.transport
-        cfg.url = fURL.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.keyFile = fKey.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.dns = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.maxToken = fToken.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.maxUid = fUid.stringValue.trimmingCharacters(in: .whitespaces)
-        cfg.debug = (fDebug.state == .on)
-        cfg.save()
+        commitFields()
+        for i in draft.indices where draft[i].name.isEmpty {
+            draft[i].name = "Профиль \(i + 1)"
+        }
+        let previous = store.selected
+        store.profiles = draft
+        // Keep the selection if it still exists, otherwise fall back.
+        store.selected = draft.contains(where: { $0.id == previous }) ? previous : draft.first?.id
+        store.save()
+        rebuildProfilesMenu()
         settingsWindow?.close()
         if ctrl.state == .connected || ctrl.state == .connecting {
             let a = NSAlert()
-            a.messageText = "Настройки сохранены"
-            a.informativeText = "Туннель сейчас активен. Новые настройки применятся после переподключения."
+            a.messageText = "Профили сохранены"
+            a.informativeText = "Туннель сейчас активен. Изменения применятся после переподключения."
             a.addButton(withTitle: "OK")
             a.runModal()
         }
