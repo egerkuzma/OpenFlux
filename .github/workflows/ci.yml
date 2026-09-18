@@ -24,14 +24,21 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Download modules
+        run: go mod download
+
       - name: go vet
-        # tunnel/tunnel.go carries a long-standing IPv6 formatting warning that
-        # predates this workflow; fail on anything else.
+        # Count only real findings — "file.go:line:col: message". Merging
+        # stderr also captures "go: downloading ..." progress lines, which look
+        # enough like findings to fail a naive check. One long-standing upstream
+        # warning in tunnel/tunnel.go is expected and ignored.
         run: |
           go vet ./... 2>&1 | tee vet.log || true
-          if grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log | grep -q ':'; then
+          findings="$(grep -E '^[^ ]+\.go:[0-9]+:[0-9]+:' vet.log \
+                      | grep -v 'tunnel/tunnel\.go:.*IPv6' || true)"
+          if [ -n "$findings" ]; then
             echo "go vet reported new problems:"
-            grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log
+            echo "$findings"
             exit 1
           fi
 
@@ -76,11 +83,14 @@ jobs:
         run: go build ./...
 
       - name: go vet
+        # See the macOS job for why the pattern is this specific.
         run: |
           go vet ./... 2>&1 | tee vet.log || true
-          if grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log | grep -q ':'; then
+          findings="$(grep -E '^[^ ]+\.go:[0-9]+:[0-9]+:' vet.log \
+                      | grep -v 'tunnel/tunnel\.go:.*IPv6' || true)"
+          if [ -n "$findings" ]; then
             echo "go vet reported new problems:"
-            grep -v 'tunnel/tunnel.go:.*does not work with IPv6' vet.log
+            echo "$findings"
             exit 1
           fi
 
