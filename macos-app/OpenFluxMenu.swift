@@ -24,14 +24,27 @@ struct Profile: Codable {
     var maxToken = ""
     var maxUid = ""
     var debug = false
+    /// Write every frame to two documents instead of one. A document that
+    /// closes drops whatever was in flight without saying so, and the tunnel's
+    /// TCP then waits out a retransmission timer measured in seconds; the copy
+    /// removes the common case, at twice the traffic into the documents.
+    var duplicate = false
 
     static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "oneme"]
 
     /// The documents this profile bonds, one per line in the editor. Several
     /// of them are what keeps the tunnel up when a provider closes one.
+    ///
+    /// The separator test has to be `isNewline`, not a comparison against
+    /// "\n". Swift counts a CR-LF pair as one Character, and that Character
+    /// equals neither "\n" nor ","; text arriving with Windows line endings
+    /// therefore did not split at all, and five documents were counted as one.
+    /// The tunnel itself splits the list it is handed, so the bond was built
+    /// correctly and nothing looked wrong — except the count in the menu, and
+    /// every decision made from it.
     var documents: [String] {
-        url.split(whereSeparator: { $0 == "\n" || $0 == "," })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+        url.split(whereSeparator: { $0.isNewline || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
 
@@ -85,6 +98,7 @@ struct Store: Codable {
         if let v = d.string(forKey: "maxToken") { p.maxToken = v }
         if let v = d.string(forKey: "maxUid") { p.maxUid = v }
         p.debug = d.bool(forKey: "debug")
+        p.duplicate = d.bool(forKey: "duplicate")
 
         let s = Store(profiles: [p], selected: p.id)
         s.save()
@@ -227,6 +241,17 @@ final class TunnelController {
         if !p.maxToken.isEmpty { args.append("--maxToken=\(p.maxToken)") }
         if !p.maxUid.isEmpty { args.append("--maxUid=\(p.maxUid)") }
         if p.debug { args.append("--debug") }
+        // The binary refuses --duplicate without a second document to copy to
+        // and without the key whose replay window discards the copy. Checking
+        // here keeps a tick in the box from producing a tunnel that exits on
+        // startup; the reason is said out loud rather than swallowed.
+        if p.duplicate {
+            if p.documents.count > 1 && !key.isEmpty {
+                args.append("--duplicate")
+            } else {
+                log.append(Data("дублирование не включено: нужны минимум две ссылки и файл ключа\n".utf8))
+            }
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -335,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var fDNS: NSTextField!
     var fToken: NSTextField!
     var fUid: NSTextField!
+    var fDuplicate: NSButton!
     var fDebug: NSButton!
     /// Profiles being edited; committed to `store` only when Save is pressed.
     var draft: [Profile] = []
@@ -659,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 552),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = "OpenFlux — профили"
@@ -678,28 +704,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             v.addSubview(f); return f
         }
 
-        label("Профиль:", 476)
-        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 472, width: 280, height: 26))
+        label("Профиль:", 508)
+        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 504, width: 280, height: 26))
         fProfiles.target = self
         fProfiles.action = #selector(switchDraftProfile)
         v.addSubview(fProfiles)
         let add = NSButton(title: "+", target: self, action: #selector(addProfile))
-        add.frame = NSRect(x: 420, y: 472, width: 36, height: 26)
+        add.frame = NSRect(x: 420, y: 504, width: 36, height: 26)
         v.addSubview(add)
         let del = NSButton(title: "−", target: self, action: #selector(deleteProfile))
-        del.frame = NSRect(x: 460, y: 472, width: 36, height: 26)
+        del.frame = NSRect(x: 460, y: 504, width: 36, height: 26)
         v.addSubview(del)
 
-        label("Название:", 436);  fName = field(436)
-        label("Транспорт:", 396)
-        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 392, width: 220, height: 26))
+        label("Название:", 468);  fName = field(468)
+        label("Транспорт:", 428)
+        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 424, width: 220, height: 26))
         fTransport.addItems(withTitles: Profile.transports)
         v.addSubview(fTransport)
 
         // Several documents, one per line: the field has to be multi-line,
         // because ten of them on a single line is unreadable and unfixable.
-        label("Ссылки:", 336)
-        let urlScroll = NSScrollView(frame: NSRect(x: 132, y: 256, width: 364, height: 100))
+        label("Ссылки:", 368)
+        let urlScroll = NSScrollView(frame: NSRect(x: 132, y: 288, width: 364, height: 100))
         urlScroll.hasVerticalScroller = true
         urlScroll.borderType = .bezelBorder
         let tv = NSTextView(frame: urlScroll.bounds)
@@ -713,21 +739,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fURL = tv
 
         let hint = NSTextField(labelWithString: "по одной ссылке в строке — трафик идёт по всем сразу")
-        hint.frame = NSRect(x: 132, y: 236, width: 364, height: 16)
+        hint.frame = NSRect(x: 132, y: 268, width: 364, height: 16)
         hint.textColor = .secondaryLabelColor
         hint.font = NSFont.systemFont(ofSize: 10)
         v.addSubview(hint)
 
-        label("Файл ключа:", 200);  fKey = field(200)
-        label("DNS-сервер:", 160);  fDNS = field(160)
-        label("maxToken:", 120);    fToken = field(120)
-        label("maxUid:", 80);       fUid = field(80)
+        label("Файл ключа:", 232);  fKey = field(232)
+        label("DNS-сервер:", 192);  fDNS = field(192)
+        label("maxToken:", 152);    fToken = field(152)
+        label("maxUid:", 112);      fUid = field(112)
+
+        fDuplicate = NSButton(checkboxWithTitle: "Дублировать кадры по двум документам", target: nil, action: nil)
+        fDuplicate.frame = NSRect(x: 132, y: 76, width: 364, height: 20)
+        v.addSubview(fDuplicate)
 
         fDebug = NSButton(checkboxWithTitle: "Debug-логи (подробный лог)", target: nil, action: nil)
         fDebug.frame = NSRect(x: 132, y: 50, width: 320, height: 20)
         v.addSubview(fDebug)
 
-        let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Какой профиль использовать — галочкой в меню «Профиль».")
+        let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Дублирование требует двух ссылок и ключа, трафика в документы вдвое больше.")
         note.frame = NSRect(x: 16, y: 28, width: 488, height: 18)
         note.textColor = .secondaryLabelColor
         note.font = NSFont.systemFont(ofSize: 11)
@@ -761,6 +791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         draft[draftIndex].dns = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].maxToken = fToken.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].maxUid = fUid.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].duplicate = (fDuplicate.state == .on)
         draft[draftIndex].debug = (fDebug.state == .on)
     }
 
@@ -775,6 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fDNS.stringValue = p.dns
         fToken.stringValue = p.maxToken
         fUid.stringValue = p.maxUid
+        fDuplicate.state = p.duplicate ? .on : .off
         fDebug.state = p.debug ? .on : .off
     }
 

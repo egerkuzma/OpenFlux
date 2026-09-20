@@ -54,6 +54,18 @@ fi
 echo "== install =="
 if [ -w /Applications ]; then DEST="/Applications"; else DEST="$HOME/Applications"; fi
 mkdir -p "$DEST"
+
+# Replacing the bundle means killing the running app, and a signal does not run
+# its teardown: openflux would outlive it with utun and the routes still
+# installed, while the fresh app reports "disconnected" and knows nothing about
+# the process holding the default route. So refuse, and say what to do.
+if pgrep -f '/usr/local/bin/openflux' >/dev/null 2>&1; then
+  echo "туннель сейчас работает." >&2
+  echo "отключи его в меню приложения и выйди из приложения, потом повтори установку." >&2
+  echo "(если туннель нужно оставить поднятым, ставь с --force — приложение потеряет с ним связь)" >&2
+  [ "${1:-}" = "--force" ] || exit 1
+fi
+
 # Stop a running instance so we can replace the bundle cleanly.
 pkill -f "$DEST/$APP/Contents/MacOS/$EXE" 2>/dev/null || true
 rm -rf "$DEST/$APP"
