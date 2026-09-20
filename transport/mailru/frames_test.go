@@ -156,3 +156,16 @@ func TestRenewRetryFitsBeforeTheCut(t *testing.T) {
 		t.Errorf("only %d retry fits before the cut; one transient failure should not be fatal", attempts)
 	}
 }
+
+// A retired session has to keep reading long enough to drain what the server
+// already sent it, but must be gone well before the provider would have cut it
+// anyway — otherwise the two connections overlap for most of a session.
+func TestRetireLingerDrainsWithoutOverlapping(t *testing.T) {
+	if retireLinger <= 0 {
+		t.Fatal("closing the old connection at once discards what the server already sent")
+	}
+	if retireLinger >= sessionLifetime-renewAfter {
+		t.Errorf("lingering %v outlasts the %v the old session had left",
+			retireLinger, sessionLifetime-renewAfter)
+	}
+}

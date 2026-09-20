@@ -487,6 +487,19 @@ const (
 	// again. Short enough that several attempts still fit before the
 	// provider's cut, long enough not to hammer a service that just refused.
 	renewRetry = 5 * time.Second
+
+	// retireLinger is how long a replaced session keeps reading before its
+	// connection is closed.
+	//
+	// Make-before-break protected what we send. It did nothing for what we
+	// receive: closing the old connection the moment the swap happened threw
+	// away whatever the server had already put into it and we had not read
+	// yet, which at twenty megabits a second is a great many frames. Measured
+	// before this existed — a transfer ran clean for six minutes, then stalled
+	// twelve times in a row at ten seconds apiece, starting twenty seconds
+	// before the nearest closure and right after two links renewed in the same
+	// second.
+	retireLinger = 3 * time.Second
 )
 
 // scheduleRenewal arranges to replace this session before the provider kills
@@ -620,7 +633,17 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	age := time.Since(t.ConnectedSince())
 	t.markConnected()
 	old.superseded.Store(true)
-	old.Conn.Close()
+	// Retire the old connection, but not this instant. Its read loop is still
+	// the one delivering whatever the server has already sent into it, and
+	// closing it here threw all of that away — the half of the handover that
+	// make-before-break did not cover. Nothing writes to it any more, so
+	// letting it read for a few more seconds costs nothing; frames that also
+	// arrive on the new session are dropped as duplicates by the replay window
+	// above.
+	utils.SafeGo("mailru.retire", func() {
+		time.Sleep(retireLinger)
+		old.Conn.Close()
+	})
 
 	// Said out loud, for the same reason a closure is: these two lines are how
 	// anyone tells a link that is being recycled cleanly from one that keeps
