@@ -14,13 +14,20 @@
 #   * The source must sit behind the exit node, so the bytes really cross the
 #     tunnel rather than the local network.
 #
-#   ./tunnel-stress.sh [гигабайт] [хост]
+#   ./tunnel-stress.sh <гигабайт> <хост>
+#
+# The host is an ssh destination reachable from behind the exit node; there is
+# no default, because a default here would be one operator's machine name.
 #
 # Ctrl+C stops it and still prints the report.
 
 set -u
 GB="${1:-3}"
-HOST="${2:-kuzmich-serv}"
+HOST="${2:-}"
+if [ -z "$HOST" ]; then
+    echo "укажите хост за выходной нодой: ./tunnel-stress.sh $GB <хост>" >&2
+    exit 1
+fi
 MB=$((GB * 1024))
 LOG="$HOME/Library/Logs/OpenFlux/openflux.log"
 STALLS="${TMPDIR:-/tmp}/tunnel-stress-stalls.txt"
