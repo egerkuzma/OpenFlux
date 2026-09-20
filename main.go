@@ -403,6 +403,13 @@ DEPRECATED (removed in v2)
 			log.Fatalf("bond documents: %v", err)
 		}
 		bond = bonded
+		// Sessions opened together expire together: the provider closes each
+		// after a fixed lifetime (measured at ~62s on Mail.ru), so without
+		// this the bond keeps collapsing to a couple of live links once a
+		// minute instead of losing one at a time. Five seconds comfortably
+		// exceeds how long a reconnect takes, which is all the spacing needs
+		// to do.
+		bonded.StaggerLinks(5 * time.Second)
 		inner = bonded
 		log.Printf("Bonded channel: %d documents", len(links))
 	}

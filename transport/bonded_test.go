@@ -17,6 +17,7 @@ type fakeLink struct {
 	started   bool
 	stopped   bool
 	cb        func([]byte)
+	stagger   time.Duration
 }
 
 func (f *fakeLink) Start() error {
@@ -66,6 +67,18 @@ func (f *fakeLink) Stats() TransportStats {
 		PacketsSent: uint64(len(f.sent)),
 		Connected:   f.connected,
 	}
+}
+
+func (f *fakeLink) SetReconnectStagger(d time.Duration) {
+	f.mu.Lock()
+	f.stagger = d
+	f.mu.Unlock()
+}
+
+func (f *fakeLink) staggerOf() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stagger
 }
 
 func (f *fakeLink) setConnected(v bool) {
@@ -282,4 +295,57 @@ func TestBondedSingleLinkIsPassThrough(t *testing.T) {
 	if links[0].count() != 4 {
 		t.Errorf("the only link carried %d, want 4", links[0].count())
 	}
+}
+
+// Links opened in the same second have their sessions closed by the provider in
+// the same second, so without an offset the bond keeps collapsing to a couple
+// of live links at once instead of losing them one at a time.
+func TestBondedStaggersLinks(t *testing.T) {
+	b, links := bondOf(&fakeLink{}, &fakeLink{}, &fakeLink{}, &fakeLink{}, &fakeLink{})
+
+	b.StaggerLinks(5 * time.Second)
+
+	for i, l := range links {
+		want := time.Duration(i) * 5 * time.Second
+		if got := l.staggerOf(); got != want {
+			t.Errorf("link %d got %v, want %v", i+1, got, want)
+		}
+	}
+
+	t.Run("the first link is not delayed", func(t *testing.T) {
+		if links[0].staggerOf() != 0 {
+			t.Error("one link has to come back immediately, or the bond is needlessly down")
+		}
+	})
+
+	t.Run("offsets are distinct", func(t *testing.T) {
+		seen := map[time.Duration]bool{}
+		for _, l := range links {
+			d := l.staggerOf()
+			if seen[d] {
+				t.Fatalf("two links share the offset %v and will still expire together", d)
+			}
+			seen[d] = true
+		}
+	})
+}
+
+func TestBondedStaggerIgnoresPointlessCases(t *testing.T) {
+	t.Run("a single link has nothing to spread apart", func(t *testing.T) {
+		b, links := bondOf(&fakeLink{})
+		b.StaggerLinks(5 * time.Second)
+		if links[0].staggerOf() != 0 {
+			t.Error("the only link must not be delayed")
+		}
+	})
+
+	t.Run("zero spacing does nothing", func(t *testing.T) {
+		b, links := bondOf(&fakeLink{}, &fakeLink{})
+		b.StaggerLinks(0)
+		for i, l := range links {
+			if l.staggerOf() != 0 {
+				t.Errorf("link %d was delayed despite zero spacing", i+1)
+			}
+		}
+	})
 }

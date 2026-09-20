@@ -46,6 +46,30 @@ func NewBondedTransport(links []Transport) (*BondedTransport, error) {
 	return &BondedTransport{links: links}, nil
 }
 
+// StaggerLinks spreads the links' reconnects, delaying link i by i*spacing the
+// first time it comes back.
+//
+// Links opened together stay in lockstep: the provider closes each session
+// after a fixed lifetime, so sessions started in the same second also expire in
+// the same second, and the bond repeatedly collapses to a couple of live links
+// instead of losing one at a time. Offsetting each link once shifts its phase
+// permanently, because every later cycle inherits the offset.
+//
+// The cost is paid once: on that first cycle the last link stays down for
+// len(links)*spacing before returning. Spacing only has to exceed how long a
+// reconnect takes — about a second — for the reconnects to stop overlapping,
+// so it is kept small rather than spread across the whole lifetime.
+func (b *BondedTransport) StaggerLinks(spacing time.Duration) {
+	if spacing <= 0 || len(b.links) < 2 {
+		return
+	}
+	for i, l := range b.links {
+		if s, ok := l.(Staggerer); ok {
+			s.SetReconnectStagger(time.Duration(i) * spacing)
+		}
+	}
+}
+
 // Len reports how many links the bond holds.
 func (b *BondedTransport) Len() int { return len(b.links) }
 

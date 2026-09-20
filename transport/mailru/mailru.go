@@ -82,6 +82,22 @@ type MailruDocsTransport struct {
 	labelMu sync.Mutex
 	label   string
 
+	// Session data is reusable: a second WebSocket authenticates with the same
+	// token and document key, and the key belongs to the document rather than
+	// the session (both verified against the live service). Caching it removes
+	// an HTTP round trip from every reconnect — and with the provider closing
+	// each session about once a minute, that was some six hundred API calls an
+	// hour across two peers.
+	infoMu     sync.Mutex
+	cachedInfo *MailruDocsInfo
+	infoExpiry time.Time
+
+	// stagger delays this link's next reconnect once, shifting its phase away
+	// from its siblings in a bond. Consumed on first use: every later cycle
+	// inherits the offset, so it never needs applying twice.
+	staggerMu sync.Mutex
+	stagger   time.Duration
+
 	// reconnecting admits one pending attempt at a time. Several paths can
 	// notice a dead connection at once (the read loop, the keep-alive), and
 	// without this they would each open a session to the same document.
@@ -105,6 +121,86 @@ func (t *MailruDocsTransport) SetLabel(label string) {
 	t.labelMu.Lock()
 	t.label = label
 	t.labelMu.Unlock()
+}
+
+// docInfo returns session data for the document, reusing the previous fetch
+// while its token is still valid.
+func (t *MailruDocsTransport) docInfo() (MailruDocsInfo, error) {
+	t.infoMu.Lock()
+	if t.cachedInfo != nil && time.Now().Before(t.infoExpiry) {
+		info := *t.cachedInfo
+		t.infoMu.Unlock()
+		return info, nil
+	}
+	t.infoMu.Unlock()
+
+	info, err := t.fetchDocInfo(t.weblink)
+	if err != nil {
+		return info, err
+	}
+
+	// Cache until shortly before the token itself expires. Falling back to a
+	// short window when the expiry cannot be read keeps a malformed or changed
+	// token from being reused indefinitely.
+	expiry := time.Now().Add(5 * time.Minute)
+	if exp, ok := jwtExpiry(info.Token); ok {
+		if safe := exp.Add(-30 * time.Second); safe.After(time.Now()) {
+			expiry = safe
+		} else {
+			expiry = time.Now()
+		}
+	}
+	t.infoMu.Lock()
+	t.cachedInfo = &info
+	t.infoExpiry = expiry
+	t.infoMu.Unlock()
+	return info, nil
+}
+
+// forgetDocInfo drops the cache, so the next attempt fetches afresh. Called
+// whenever a connection made with cached data fails early, which is what a
+// no-longer-accepted token looks like from here.
+func (t *MailruDocsTransport) forgetDocInfo() {
+	t.infoMu.Lock()
+	t.cachedInfo = nil
+	t.infoMu.Unlock()
+}
+
+// jwtExpiry reads the exp claim out of a JWT without verifying the signature:
+// we only need to know when to stop reusing the token, not whether to trust
+// it — the server decides that.
+func jwtExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
+}
+
+// SetReconnectStagger implements transport.Staggerer.
+func (t *MailruDocsTransport) SetReconnectStagger(d time.Duration) {
+	t.staggerMu.Lock()
+	t.stagger = d
+	t.staggerMu.Unlock()
+}
+
+// takeStagger returns the pending offset and clears it.
+func (t *MailruDocsTransport) takeStagger() time.Duration {
+	t.staggerMu.Lock()
+	defer t.staggerMu.Unlock()
+	d := t.stagger
+	t.stagger = 0
+	return d
 }
 
 // name returns the label for log lines, falling back to the transport name.
@@ -257,45 +353,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
 		session.safeWrite(websocket.TextMessage, []byte(auth1))
 
-		authMsg := map[string]interface{}{
-			"type":                "auth",
-			"docid":               info.DocKey,
-			"documentCallbackUrl": info.CallbackURL,
-			"token":               "fghhfgsjdgfjs",
-			"user": map[string]interface{}{
-				"id":        info.EditorUserID,
-				"username":  userID,
-				"indexUser": -1,
-			},
-			"editorType":         0,
-			"lastOtherSaveTime":  -1,
-			"block":              []interface{}{},
-			"documentFormatSave": 65,
-			"view":               false,
-			"isCloseCoAuthoring": false,
-			"openCmd": map[string]interface{}{
-				"c":               "open",
-				"id":              info.DocKey,
-				"userid":          info.EditorUserID,
-				"format":          info.FileType,
-				"url":             info.DocURL,
-				"title":           info.DocTitle,
-				"lcid":            25,
-				"nobase64":        true,
-				"convertToOrigin": ".pdf.xps.oxps.djvu",
-			},
-			"lang":                  "ru",
-			"mode":                  "edit",
-			"permissions":           info.Permissions,
-			"IsAnonymousUser":       false,
-			"timezoneOffset":        -180,
-			"coEditingMode":         "fast",
-			"jwtOpen":               info.Token,
-			"time":                  1000,
-			"supportAuthChangesAck": true,
-		}
-		messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
+		session.safeWrite(websocket.TextMessage, []byte(authMessage(info, userID)))
 
 		connectedAt := time.Now()
 		for t.IsRunning() {
@@ -311,9 +369,14 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				t.SetConnected(false)
 				conn.Close()
 
+				// A session that barely lasted suggests the data we opened it
+				// with is no longer good; a long-lived one that ends is just
+				// the provider recycling it, and the cache is still fine.
 				next := attempt
 				if time.Since(connectedAt) > 15*time.Second {
 					next = -1
+				} else {
+					t.forgetDocInfo()
 				}
 				t.scheduleReconnect(next)
 				return
@@ -321,6 +384,51 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			t.handleMessage(session, message)
 		}
 	}()
+}
+
+// authMessage builds the socket.io frame that joins the collaborative editing
+// session. Extracted so the reuse experiment can send exactly what the
+// transport sends, rather than an approximation of it.
+func authMessage(info MailruDocsInfo, userID string) string {
+	authMsg := map[string]interface{}{
+		"type":                "auth",
+		"docid":               info.DocKey,
+		"documentCallbackUrl": info.CallbackURL,
+		"token":               "fghhfgsjdgfjs",
+		"user": map[string]interface{}{
+			"id":        info.EditorUserID,
+			"username":  userID,
+			"indexUser": -1,
+		},
+		"editorType":         0,
+		"lastOtherSaveTime":  -1,
+		"block":              []interface{}{},
+		"documentFormatSave": 65,
+		"view":               false,
+		"isCloseCoAuthoring": false,
+		"openCmd": map[string]interface{}{
+			"c":               "open",
+			"id":              info.DocKey,
+			"userid":          info.EditorUserID,
+			"format":          info.FileType,
+			"url":             info.DocURL,
+			"title":           info.DocTitle,
+			"lcid":            25,
+			"nobase64":        true,
+			"convertToOrigin": ".pdf.xps.oxps.djvu",
+		},
+		"lang":                  "ru",
+		"mode":                  "edit",
+		"permissions":           info.Permissions,
+		"IsAnonymousUser":       false,
+		"timezoneOffset":        -180,
+		"coEditingMode":         "fast",
+		"jwtOpen":               info.Token,
+		"time":                  1000,
+		"supportAuthChangesAck": true,
+	}
+	messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
+	return fmt.Sprintf("42%s", string(messagePart))
 }
 
 func (t *MailruDocsTransport) writerLoop() {
@@ -458,6 +566,12 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 	defer t.reconnecting.Store(false)
 
 	d := reconnectBackoff(next)
+	if extra := t.takeStagger(); extra > 0 {
+		// Once, on the way back from the first closure: hold off so this link
+		// stops expiring in the same second as its siblings.
+		utils.Infof("[%s] holding off %v to spread the links apart", t.name(), extra)
+		d += extra
+	}
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
 	time.Sleep(d)
 	if !t.IsRunning() {

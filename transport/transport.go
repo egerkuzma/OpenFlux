@@ -32,6 +32,12 @@ type Labeler interface {
 	SetLabel(label string)
 }
 
+// Staggerer is implemented by transports whose next reconnect can be pushed
+// back once, to shift a link's phase relative to its siblings.
+type Staggerer interface {
+	SetReconnectStagger(d time.Duration)
+}
+
 type TransportStats struct {
 	BytesSent     uint64
 	BytesReceived uint64
