@@ -108,6 +108,11 @@ type MailruDocsTransport struct {
 	staggerMu sync.Mutex
 	stagger   time.Duration
 
+	// retiring is the session just replaced by a handover, and retiringUntil
+	// is how long frames are still copied to it. See writeOverlap.
+	retiring      *DocSession
+	retiringUntil time.Time
+
 	// reconnecting admits one pending attempt at a time. Several paths can
 	// notice a dead connection at once (the read loop, the keep-alive), and
 	// without this they would each open a session to the same document.
@@ -500,6 +505,28 @@ const (
 	// before the nearest closure and right after two links renewed in the same
 	// second.
 	retireLinger = 3 * time.Second
+
+	// writeOverlap is how long frames are written to the replaced session as
+	// well as to its replacement.
+	//
+	// The handover swaps once the server acknowledges the namespace join. It
+	// has not yet accepted our identity on the document by then — that
+	// confirmation can take half a minute, far more than the eleven seconds
+	// the old session has left — and frames written before it lands appear to
+	// go nowhere. Measured: a twenty-minute transfer ran eleven minutes clean
+	// and then stalled for forty-five seconds without a single byte arriving,
+	// beginning in the same second the sending peer renewed two of its links.
+	// The two short stalls earlier in the same run each began two seconds
+	// after a renewal on the receiving peer.
+	//
+	// Waiting for the confirmation is not available, so both sessions are
+	// written to for a moment instead and whichever the server honours
+	// delivers. The copy is free for the same reason frame duplication was:
+	// the replay window above discards whatever arrives twice. It is the
+	// mirror of retireLinger — that one keeps reading the old session, this
+	// one keeps writing to it — and is kept shorter so it never writes to a
+	// connection that has already been closed.
+	writeOverlap = 2 * time.Second
 )
 
 // scheduleRenewal arranges to replace this session before the provider kills
@@ -624,6 +651,8 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 		return
 	}
 	t.session = fresh
+	t.retiring = old
+	t.retiringUntil = time.Now().Add(writeOverlap)
 	// Stated rather than assumed: the flag is already true, but the keep-alive
 	// can turn it false if its write lands on the connection we are about to
 	// retire, and nothing on this path would ever turn it back on.
@@ -860,8 +889,28 @@ func (t *MailruDocsTransport) writerLoop() {
 			time.Sleep(15 * time.Millisecond)
 			continue // keep pending; the reconnect will bring up a new conn
 		}
+		// Just after a handover, send the same frame down the session being
+		// retired as well: the replacement may not be carrying traffic yet.
+		// Errors are ignored — the frame has already been written to the
+		// session that is supposed to carry it.
+		if shadow := t.retiringSession(); shadow != nil && shadow != session {
+			_ = shadow.safeWrite(websocket.TextMessage, []byte(msg))
+		}
 		pending = nil
 	}
+}
+
+// retiringSession returns the session replaced by the most recent handover
+// while frames are still worth copying to it, and nil once that moment has
+// passed.
+func (t *MailruDocsTransport) retiringSession() *DocSession {
+	t.Mu.RLock()
+	s, until := t.retiring, t.retiringUntil
+	t.Mu.RUnlock()
+	if s == nil || time.Now().After(until) {
+		return nil
+	}
+	return s
 }
 
 func (t *MailruDocsTransport) keepAliveLoop() {

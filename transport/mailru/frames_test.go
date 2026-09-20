@@ -169,3 +169,15 @@ func TestRetireLingerDrainsWithoutOverlapping(t *testing.T) {
 			retireLinger, sessionLifetime-renewAfter)
 	}
 }
+
+// The two halves of the handover have to fit together: frames are copied to
+// the retired session only while that session is still open to receive them.
+func TestWriteOverlapFitsInsideTheLinger(t *testing.T) {
+	if writeOverlap <= 0 {
+		t.Fatal("without an overlap, frames written before the server accepts the new session are lost")
+	}
+	if writeOverlap >= retireLinger {
+		t.Errorf("writing for %v to a connection closed after %v would write to a closed socket",
+			writeOverlap, retireLinger)
+	}
+}
