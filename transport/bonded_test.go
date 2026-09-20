@@ -76,7 +76,7 @@ func (f *fakeLink) Stats() TransportStats {
 	}
 }
 
-func (f *fakeLink) SetReconnectStagger(d time.Duration) {
+func (f *fakeLink) SetStartStagger(d time.Duration) {
 	f.mu.Lock()
 	f.stagger = d
 	f.mu.Unlock()
@@ -342,9 +342,11 @@ func TestBondedSingleLinkIsPassThrough(t *testing.T) {
 	}
 }
 
-// Links opened in the same second have their sessions closed by the provider in
-// the same second, so without an offset the bond keeps collapsing to a couple
-// of live links at once instead of losing them one at a time.
+// Links opened in the same second have their sessions ended by the provider in
+// the same second, so without an offset they also renew together, and one
+// failed renewal takes several of them down at once. The offset is applied to
+// the first connection, not to a reconnect: a bond expiring all at once is
+// exactly when it must not be held back.
 func TestBondedStaggersLinks(t *testing.T) {
 	b, links := bondOf(&fakeLink{}, &fakeLink{}, &fakeLink{}, &fakeLink{}, &fakeLink{})
 
@@ -359,7 +361,7 @@ func TestBondedStaggersLinks(t *testing.T) {
 
 	t.Run("the first link is not delayed", func(t *testing.T) {
 		if links[0].staggerOf() != 0 {
-			t.Error("one link has to come back immediately, or the bond is needlessly down")
+			t.Error("one link has to come up immediately, or the tunnel waits for nothing")
 		}
 	})
 

@@ -58,26 +58,32 @@ func NewBondedTransport(links []Transport) (*BondedTransport, error) {
 	return &BondedTransport{links: links}, nil
 }
 
-// StaggerLinks spreads the links' reconnects, delaying link i by i*spacing the
-// first time it comes back.
+// StaggerLinks spreads the links in time, holding link i back by i*spacing
+// before it first connects.
 //
-// Links opened together stay in lockstep: the provider closes each session
-// after a fixed lifetime, so sessions started in the same second also expire in
-// the same second, and the bond repeatedly collapses to a couple of live links
-// instead of losing one at a time. Offsetting each link once shifts its phase
-// permanently, because every later cycle inherits the offset.
+// Links opened together stay in lockstep: the provider ends each session a
+// fixed time after it opens, so sessions started in the same second are also
+// renewed — and, when a renewal does not make it, closed — in the same second.
+// Offsetting each link once shifts its phase permanently, because every later
+// cycle inherits the offset.
 //
-// The cost is paid once: on that first cycle the last link stays down for
-// len(links)*spacing before returning. Spacing only has to exceed how long a
-// reconnect takes — about a second — for the reconnects to stop overlapping,
-// so it is kept small rather than spread across the whole lifetime.
+// The offset goes on the first connection, not on the first reconnect, which
+// is where it used to be. That was the worst possible moment: a bond expiring
+// all at once is precisely when it is down to one or two live links, and
+// holding the rest back for up to len(links)*spacing deepened the outage while
+// traffic was flowing. At startup nothing is flowing, the tunnel waits only
+// for the first link to come up, and the cost is paid where nobody feels it.
+//
+// Spacing only has to exceed how long a connection takes — about a second —
+// for the links to stop moving in lockstep, so it is kept small rather than
+// spread across the whole session lifetime.
 func (b *BondedTransport) StaggerLinks(spacing time.Duration) {
 	if spacing <= 0 || len(b.links) < 2 {
 		return
 	}
 	for i, l := range b.links {
 		if s, ok := l.(Staggerer); ok {
-			s.SetReconnectStagger(time.Duration(i) * spacing)
+			s.SetStartStagger(time.Duration(i) * spacing)
 		}
 	}
 }

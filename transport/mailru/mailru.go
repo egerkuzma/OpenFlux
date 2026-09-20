@@ -102,8 +102,8 @@ type MailruDocsTransport struct {
 	connectedAtMu sync.Mutex
 	connectedAt   time.Time
 
-	// stagger delays this link's next reconnect once, shifting its phase away
-	// from its siblings in a bond. Consumed on first use: every later cycle
+	// stagger holds this link's first connection back once, shifting its phase
+	// away from its siblings in a bond. Consumed on use: every later cycle
 	// inherits the offset, so it never needs applying twice.
 	staggerMu sync.Mutex
 	stagger   time.Duration
@@ -210,8 +210,8 @@ func (t *MailruDocsTransport) markConnected() {
 	t.connectedAtMu.Unlock()
 }
 
-// SetReconnectStagger implements transport.Staggerer.
-func (t *MailruDocsTransport) SetReconnectStagger(d time.Duration) {
+// SetStartStagger implements transport.Staggerer.
+func (t *MailruDocsTransport) SetStartStagger(d time.Duration) {
 	t.staggerMu.Lock()
 	t.stagger = d
 	t.staggerMu.Unlock()
@@ -258,7 +258,21 @@ func (t *MailruDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
-	t.connectToDoc(0)
+
+	// A bond hands each link a different offset so their sessions do not all
+	// start — and so do not all renew — in the same second. Paid here, before
+	// anything is flowing, rather than on a reconnect.
+	if d := t.takeStagger(); d > 0 {
+		utils.Infof("[%s] starting in %v to spread the links apart", t.name(), d)
+		utils.SafeGo("mailru.delayedStart", func() {
+			time.Sleep(d)
+			if t.IsRunning() {
+				t.connectToDoc(0)
+			}
+		})
+	} else {
+		t.connectToDoc(0)
+	}
 
 	return nil
 }
@@ -905,13 +919,10 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 	// a failure there must be free to schedule the next attempt.
 	defer t.reconnecting.Store(false)
 
+	// No stagger here. Phase is set by holding the first connection back, at
+	// startup; adding it to a reconnect would hold a link down at the one
+	// moment the bond most needs it back.
 	d := reconnectBackoff(next)
-	if extra := t.takeStagger(); extra > 0 {
-		// Once, on the way back from the first closure: hold off so this link
-		// stops expiring in the same second as its siblings.
-		utils.Infof("[%s] holding off %v to spread the links apart", t.name(), extra)
-		d += extra
-	}
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
 	time.Sleep(d)
 	if !t.IsRunning() {

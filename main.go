@@ -419,12 +419,13 @@ DEPRECATED (removed in v2)
 			log.Fatalf("bond documents: %v", err)
 		}
 		bond = bonded
-		// Sessions opened together expire together: the provider closes each
-		// after a fixed lifetime (measured at ~62s on Mail.ru), so without
-		// this the bond keeps collapsing to a couple of live links once a
-		// minute instead of losing one at a time. Five seconds comfortably
-		// exceeds how long a reconnect takes, which is all the spacing needs
-		// to do.
+		// Sessions opened together expire together: the provider ends each
+		// after a fixed lifetime (61s on Mail.ru, measured across 64 of them),
+		// so links started in the same second also renew in the same second,
+		// and a renewal that does not make it takes several of them down at
+		// once. The offset is applied to each link's first connection, where
+		// no traffic is flowing yet. Five seconds comfortably exceeds how long
+		// a connection takes, which is all the spacing needs to do.
 		bonded.StaggerLinks(5 * time.Second)
 		inner = bonded
 		log.Printf("Bonded channel: %d documents", len(links))

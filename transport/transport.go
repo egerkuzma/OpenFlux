@@ -32,10 +32,10 @@ type Labeler interface {
 	SetLabel(label string)
 }
 
-// Staggerer is implemented by transports whose next reconnect can be pushed
+// Staggerer is implemented by transports whose first connection can be held
 // back once, to shift a link's phase relative to its siblings.
 type Staggerer interface {
-	SetReconnectStagger(d time.Duration)
+	SetStartStagger(d time.Duration)
 }
 
 // Freshness is implemented by transports that can say when their current
