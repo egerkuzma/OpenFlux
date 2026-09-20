@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -217,6 +218,14 @@ func (c *TUNClient) writeToTun() {
 		out[3] = 2 // AF_INET
 		copy(out[4:], pkt)
 		if _, err := c.fd.Write(out); err != nil {
+			// A closed interface is the end, not a bad packet: shutting down
+			// closed it, and every remaining queued packet would report the
+			// same thing. Skipping only makes sense for errors a later packet
+			// might survive.
+			if errors.Is(err, os.ErrClosed) {
+				utils.Debugf("[TUN] interface closed, write loop done")
+				return
+			}
 			failures++
 			utils.Debugf("[TUN] write failed (%d in a row, %d bytes): %v", failures, len(pkt), err)
 			if failures >= maxConsecutiveWriteErrors {

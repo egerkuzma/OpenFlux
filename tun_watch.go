@@ -35,6 +35,10 @@ type SocketWatcher struct {
 	// (e.g. a DNS resolver behind the exit node) and so must never get a
 	// /32 route via the physical gateway.
 	isProtected func(string) bool
+
+	// reportedProtected remembers which addresses we have already explained,
+	// so the periodic snapshot does not repeat itself forever.
+	reportedProtected map[string]bool
 }
 
 // SetProtected installs the predicate guarding addresses from being bypassed.
@@ -46,12 +50,13 @@ func (w *SocketWatcher) SetProtected(fn func(string) bool) {
 
 func NewSocketWatcher(gateway string, onStable func()) *SocketWatcher {
 	return &SocketWatcher{
-		pid:      os.Getpid(),
-		gateway:  gateway,
-		stop:     make(chan struct{}),
-		known:    make(map[string]bool),
-		lastSet:  make(map[string]bool),
-		onStable: onStable,
+		pid:               os.Getpid(),
+		gateway:           gateway,
+		stop:              make(chan struct{}),
+		known:             make(map[string]bool),
+		lastSet:           make(map[string]bool),
+		reportedProtected: make(map[string]bool),
+		onStable:          onStable,
 	}
 }
 
@@ -142,9 +147,14 @@ func (w *SocketWatcher) snapshot() {
 		if w.known[ip] {
 			continue
 		}
-		// Never bypass an address that has to stay inside the tunnel.
+		// Never bypass an address that has to stay inside the tunnel. Say so
+		// once: the snapshot runs every couple of seconds and would otherwise
+		// repeat this line for the life of the process.
 		if w.isProtected != nil && w.isProtected(ip) {
-			utils.Debugf("[WATCH] %s is protected, keeping it in the tunnel", ip)
+			if !w.reportedProtected[ip] {
+				w.reportedProtected[ip] = true
+				utils.Debugf("[WATCH] %s is protected, keeping it in the tunnel", ip)
+			}
 			continue
 		}
 		if err := w.addRoute(ip); err != nil {

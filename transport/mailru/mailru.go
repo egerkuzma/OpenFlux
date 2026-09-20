@@ -26,6 +26,18 @@ import (
 	"openflux/utils"
 )
 
+// wsReadTimeout bounds how long we wait for anything at all from the server.
+//
+// A dead TCP connection is often silent rather than reset — after a NAT
+// timeout, a sleep, or a network hiccup there is no FIN and no RST — and a
+// read without a deadline then blocks forever. No error means no reconnect,
+// so the transport sits there looking connected while carrying nothing.
+//
+// Both peers send a keep-alive every KeepAliveInterval (10s) and each receives
+// the other's, so a live channel is never quiet for long; a minute of silence
+// means the connection is gone.
+const wsReadTimeout = 60 * time.Second
+
 const mailruUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 
 var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
@@ -64,6 +76,16 @@ type MailruDocsTransport struct {
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	// label names this link inside a bond ("документ 2 из 5"), so a failure
+	// says which document dropped. Empty when there is only one.
+	labelMu sync.Mutex
+	label   string
+
+	// reconnecting admits one pending attempt at a time. Several paths can
+	// notice a dead connection at once (the read loop, the keep-alive), and
+	// without this they would each open a session to the same document.
+	reconnecting atomic.Bool
 }
 
 // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
@@ -76,6 +98,23 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 	}
 	t.baseUserID = randUserID()
 	return t
+}
+
+// SetLabel implements transport.Labeler.
+func (t *MailruDocsTransport) SetLabel(label string) {
+	t.labelMu.Lock()
+	t.label = label
+	t.labelMu.Unlock()
+}
+
+// name returns the label for log lines, falling back to the transport name.
+func (t *MailruDocsTransport) name() string {
+	t.labelMu.Lock()
+	defer t.labelMu.Unlock()
+	if t.label == "" {
+		return "mailru"
+	}
+	return t.label
 }
 
 func normalizeWeblink(weblink string) string {
@@ -106,10 +145,6 @@ func (t *MailruDocsTransport) Start() error {
 }
 
 func (t *MailruDocsTransport) Send(data []byte) error {
-	if !t.IsConnected() {
-		return fmt.Errorf("transport not connected")
-	}
-
 	t.Mu.RLock()
 	session := t.session
 	t.Mu.RUnlock()
@@ -117,6 +152,14 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 	if session == nil {
 		return fmt.Errorf("no active session")
 	}
+
+	// Deliberately not gated on IsConnected: a reconnect takes well under a
+	// second, the write queue survives it, and writerLoop holds each packet
+	// until a new session exists. Refusing here instead threw those packets
+	// away, and the TCP streams inside the tunnel then waited out a
+	// retransmission timeout — turning a sub-second blip into a stall of
+	// several seconds. The queue is bounded, so a genuinely long outage still
+	// applies backpressure rather than buffering without limit.
 
 	select {
 	case session.WriteQueue <- data:
@@ -154,7 +197,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 
 		info, err := t.fetchDocInfo(t.weblink)
 		if err != nil {
-			utils.Debugf("[M-DOCS] fetchDocInfo failed: %v", err)
+			utils.Infof("[%s] cannot open the document: %v", t.name(), err)
 			t.scheduleReconnect(attempt)
 			return
 		}
@@ -177,11 +220,11 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			if resp != nil {
 				status = resp.StatusCode
 			}
-			utils.Debugf("[M-DOCS] WebSocket dial failed (http %d): %v", status, err)
+			utils.Infof("[%s] connect failed (http %d): %v", t.name(), status, err)
 			t.scheduleReconnect(attempt)
 			return
 		}
-		utils.Debugf("[M-DOCS] WebSocket connected")
+		utils.Infof("[%s] connected", t.name())
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -256,9 +299,15 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 
 		connectedAt := time.Now()
 		for t.IsRunning() {
+			// Reset before every read: the deadline is absolute, not a
+			// per-call idle timeout.
+			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				utils.Debugf("[M-DOCS] Read error: %v", err)
+				// The reason a link dies is one line per event and the first
+				// thing anyone asks, so it belongs in the ordinary log rather
+				// than behind --debug.
+				utils.Infof("[%s] connection lost: %v", t.name(), err)
 				t.SetConnected(false)
 				conn.Close()
 
@@ -335,8 +384,13 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-				utils.Debugf("[M-DOCS] Keep-alive failed: %v", err)
+				// Marking it disconnected is not enough: nothing acts on that
+				// flag. Close the connection instead, which makes the read
+				// loop return and take its usual reconnect path — one place
+				// owns reconnection rather than two racing each other.
+				utils.Infof("[%s] keep-alive failed, dropping the connection: %v", t.name(), err)
 				t.SetConnected(false)
+				session.Conn.Close()
 			}
 		}
 	}
@@ -395,6 +449,13 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 	if !t.IsRunning() || next >= t.GetConfig().MaxReconnectAttempts {
 		return
 	}
+	if !t.reconnecting.CompareAndSwap(false, true) {
+		utils.Debugf("[M-DOCS] reconnect already pending, skipping")
+		return
+	}
+	// Held only across the backoff: connectToDoc hands off to a goroutine, and
+	// a failure there must be free to schedule the next attempt.
+	defer t.reconnecting.Store(false)
 
 	d := reconnectBackoff(next)
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)

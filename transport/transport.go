@@ -23,6 +23,15 @@ type Transport interface {
 	Stats() TransportStats
 }
 
+// Labeler is implemented by transports that can be told which link they are.
+// Bonding several documents makes a bare "connection lost" useless — the
+// operator needs to know which of them dropped — and a label supplied from
+// outside keeps document URLs, which are effectively shared secrets, out of
+// the log.
+type Labeler interface {
+	SetLabel(label string)
+}
+
 type TransportStats struct {
 	BytesSent     uint64
 	BytesReceived uint64
@@ -137,7 +146,6 @@ func (b *BaseTransport) RecordReceive(bytes int) {
 func (b *BaseTransport) RecordReconnect() {
 	b.reconnectAttempts.Add(1)
 }
-
 
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config

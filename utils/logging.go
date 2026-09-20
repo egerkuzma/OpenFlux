@@ -62,3 +62,12 @@ func SafeGo(name string, fn func()) {
 		fn()
 	}()
 }
+
+// Infof logs something an operator would want to see without turning on
+// --debug: a connection died, a reconnect failed, a link came back. These are
+// rare enough to say out loud, unlike the per-packet detail in Debugf, which
+// would bury them. Output honours SetOutput, so it still reaches the app's log
+// window.
+func Infof(format string, args ...interface{}) {
+	log.Printf(format, args...)
+}
