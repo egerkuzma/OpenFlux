@@ -482,6 +482,11 @@ const (
 	// which Mail.ru can delay by half a minute; it is the acknowledgement that
 	// the join was seen at all.
 	joinAckTimeout = 3 * time.Second
+
+	// renewRetry is how soon a renewal that could not be completed tries
+	// again. Short enough that several attempts still fit before the
+	// provider's cut, long enough not to hammer a service that just refused.
+	renewRetry = 5 * time.Second
 )
 
 // scheduleRenewal arranges to replace this session before the provider kills
@@ -495,8 +500,21 @@ const (
 // carries traffic until the new one is ready. Break-before-make becomes
 // make-before-break.
 func (t *MailruDocsTransport) scheduleRenewal(session *DocSession) {
+	t.scheduleRenewalIn(session, renewAfter)
+}
+
+// scheduleRenewalIn is scheduleRenewal with an explicit delay, used to try
+// again soon after a renewal could not be completed.
+//
+// Rescheduling is not optional. The timer is one-shot, so a renewal that gives
+// up without leaving a successor behind ends renewal for that link for good:
+// it then survives only until the provider's next cut and falls back to
+// reconnecting. That is exactly what happened — links dropped out of the cycle
+// one at a time, each after a single transient failure, and the bond carried
+// on with the ones still renewing while the rest quietly stopped.
+func (t *MailruDocsTransport) scheduleRenewalIn(session *DocSession, delay time.Duration) {
 	utils.SafeGo("mailru.renew", func() {
-		timer := time.NewTimer(renewAfter)
+		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		<-timer.C
 		if !t.IsRunning() || session.superseded.Load() {
@@ -525,7 +543,8 @@ func (t *MailruDocsTransport) scheduleRenewal(session *DocSession) {
 func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	info, err := t.docInfo()
 	if err != nil {
-		utils.Debugf("[M-DOCS] [%s] renewal gave up, document info: %v", t.name(), err)
+		utils.Debugf("[M-DOCS] [%s] renewal deferred, document info: %v", t.name(), err)
+		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
 
@@ -542,7 +561,8 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 
 	conn, _, err := dialer.Dial(info.WsURL, headers)
 	if err != nil {
-		utils.Debugf("[M-DOCS] [%s] renewal gave up, dial: %v", t.name(), err)
+		utils.Debugf("[M-DOCS] [%s] renewal deferred, dial: %v", t.name(), err)
+		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
 
@@ -558,8 +578,9 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	}
 
 	if !t.awaitOpenPacket(fresh, conn) {
-		utils.Debugf("[M-DOCS] [%s] renewal gave up, no open packet", t.name())
+		utils.Debugf("[M-DOCS] [%s] renewal deferred, no open packet", t.name())
 		conn.Close()
+		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
 	t.authenticate(fresh, info, fresh.UserID)
@@ -567,8 +588,9 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 		// Swapping onto a connection the server has not acknowledged would
 		// hand traffic to a session that may never carry it. The old one is
 		// still good for another ten seconds.
-		utils.Debugf("[M-DOCS] [%s] renewal gave up, join not acknowledged", t.name())
+		utils.Debugf("[M-DOCS] [%s] renewal deferred, join not acknowledged", t.name())
 		conn.Close()
+		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
 
@@ -582,6 +604,8 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	t.Mu.Lock()
 	if t.session != old || t.reconnecting.Load() {
 		t.Mu.Unlock()
+		// No retry here, and only here: the link belongs to another session
+		// now, and that one brought its own timer with it.
 		utils.Debugf("[M-DOCS] [%s] renewal dropped, a reconnect got there first", t.name())
 		conn.Close()
 		return
@@ -827,6 +851,26 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
+
+		// A session older than the provider allows is a contradiction: either
+		// it was renewed and this age is stale, or nobody is watching it any
+		// more. The second is the dangerous one — the link goes on counting as
+		// live while no read loop is left to notice the next cut, so the bond
+		// keeps it in reserve and would hand it traffic. Dropping the
+		// connection puts it back on the one path that knows how to recover.
+		//
+		// This is a net, not a mechanism: renewal at fifty seconds is what
+		// should keep sessions young. It is here because the first version of
+		// renewal could stop silently, and a link that stops renewing must not
+		// also stop being noticed.
+		if session != nil && session.Conn != nil {
+			if age := time.Since(t.ConnectedSince()); age > sessionLifetime+20*time.Second {
+				utils.Infof("[%s] session is %.0fs old and was never renewed, dropping it", t.name(), age.Seconds())
+				t.SetConnected(false)
+				session.Conn.Close()
+				continue
+			}
+		}
 
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {

@@ -56,7 +56,11 @@ func SafeGo(name string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				Debugf("[PANIC] recovered in %s: %v", name, r)
+				// A recovered panic is a defect, not noise. Behind --debug it
+				// was invisible, and the goroutine died silently: a session
+				// renewer or a reader could stop for good and the only symptom
+				// would be a link that quietly went still.
+				Infof("[PANIC] recovered in %s: %v", name, r)
 			}
 		}()
 		fn()

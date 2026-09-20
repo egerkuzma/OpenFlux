@@ -129,3 +129,30 @@ func TestRenewalLeavesMarginBeforeTheCut(t *testing.T) {
 		t.Errorf("margin is %v; the measured sessions varied by eight seconds around the median", margin)
 	}
 }
+
+// The watchdog only makes sense if it fires after a renewal should have
+// happened, not before: a session that is merely due for renewal must not be
+// dropped as unwatched.
+func TestWatchdogFiresAfterRenewalShouldHave(t *testing.T) {
+	watchdog := sessionLifetime + 20*time.Second
+	if watchdog <= renewAfter {
+		t.Fatalf("watchdog at %v would fire before renewal at %v", watchdog, renewAfter)
+	}
+	if watchdog <= sessionLifetime {
+		t.Errorf("watchdog at %v fires before the provider's own cut at %v — "+
+			"an ordinary closure would be reported as an unwatched session", watchdog, sessionLifetime)
+	}
+}
+
+// A renewal that could not be completed has to try again soon enough that
+// several attempts still fit before the provider's cut; otherwise one
+// transient failure ends renewal for that link.
+func TestRenewRetryFitsBeforeTheCut(t *testing.T) {
+	left := sessionLifetime - renewAfter
+	if renewRetry >= left {
+		t.Fatalf("a retry after %v does not fit in the %v left before the cut", renewRetry, left)
+	}
+	if attempts := int(left / renewRetry); attempts < 2 {
+		t.Errorf("only %d retry fits before the cut; one transient failure should not be fatal", attempts)
+	}
+}
