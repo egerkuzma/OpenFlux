@@ -60,6 +60,10 @@ type DocSession struct {
 	WriteQueue chan []byte
 	UserID     string
 	writeMu    sync.Mutex
+
+	// superseded marks a session that was replaced on purpose, so its read
+	// loop can tell a planned handover from a failure and stay quiet.
+	superseded atomic.Bool
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
@@ -384,50 +388,236 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			utils.Debugf("[M-DOCS] [%s] no open packet in %v, joining anyway", t.name(), openPacketTimeout)
 		}
 
-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
+		t.authenticate(session, info, userID)
+		t.scheduleRenewal(session)
+		t.readLoop(session, attempt)
+	}()
+}
 
-		session.safeWrite(websocket.TextMessage, []byte(authMessage(info, userID)))
+// authenticate joins the namespace and identifies us on it.
+func (t *MailruDocsTransport) authenticate(session *DocSession, info MailruDocsInfo, userID string) {
+	session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf(`40{"token":"%s"}`, info.Token)))
+	session.safeWrite(websocket.TextMessage, []byte(authMessage(info, userID)))
+}
 
-		connectedAt := time.Now()
-		// What arrived just before a close is the only clue to why the
-		// provider closed the session. Everything that is not a ping, an auth
-		// reply or a cursor update is discarded without a word, and the close
-		// itself carries an empty status — gorilla reports that as 1005, "no
-		// status received", which means the server shut the session down
-		// deliberately and politely rather than the connection breaking. If it
-		// says anything first, it says it in a frame we were throwing away.
-		var tail []recentFrame
-		for t.IsRunning() {
-			// Reset before every read: the deadline is absolute, not a
-			// per-call idle timeout.
-			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				// The reason a link dies is one line per event and the first
-				// thing anyone asks, so it belongs in the ordinary log rather
-				// than behind --debug.
-				utils.Infof("[%s] connection lost: %v", t.name(), err)
-				reportLastFrames(t.name(), tail)
-				t.SetConnected(false)
+// readLoop carries one session until its connection ends, and then arranges
+// for a replacement — unless a replacement is already carrying the traffic.
+func (t *MailruDocsTransport) readLoop(session *DocSession, attempt int) {
+	conn := session.Conn
+	connectedAt := time.Now()
+	// What arrived just before a close is the only clue to why the provider
+	// closed the session. Everything that is not a ping, an auth reply or a
+	// cursor update is discarded without a word, and the close itself carries
+	// an empty status — gorilla reports that as 1005, "no status received",
+	// which means the server shut the session down deliberately and politely
+	// rather than the connection breaking. If it says anything first, it says
+	// it in a frame we were throwing away.
+	var tail []recentFrame
+	for t.IsRunning() {
+		// Reset before every read: the deadline is absolute, not a per-call
+		// idle timeout.
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			// A session we replaced on purpose is not a failure and must not
+			// start a reconnect: its successor is already carrying traffic,
+			// and reconnecting here would open a third session to the same
+			// document.
+			if session.superseded.Load() {
+				utils.Debugf("[M-DOCS] [%s] old session closed after handover: %v", t.name(), err)
 				conn.Close()
-
-				// A session that barely lasted suggests the data we opened it
-				// with is no longer good; a long-lived one that ends is just
-				// the provider recycling it, and the cache is still fine.
-				next := attempt
-				if time.Since(connectedAt) > 15*time.Second {
-					next = -1
-				} else {
-					t.forgetDocInfo()
-				}
-				t.scheduleReconnect(next)
 				return
 			}
-			tail = rememberFrame(tail, message)
-			t.handleMessage(session, message)
+			// The reason a link dies is one line per event and the first thing
+			// anyone asks, so it belongs in the ordinary log rather than
+			// behind --debug.
+			utils.Infof("[%s] connection lost: %v", t.name(), err)
+			reportLastFrames(t.name(), tail)
+			t.SetConnected(false)
+			conn.Close()
+
+			// A session that barely lasted suggests the data we opened it with
+			// is no longer good; a long-lived one that ends is just the
+			// provider recycling it, and the cache is still fine.
+			next := attempt
+			if time.Since(connectedAt) > 15*time.Second {
+				next = -1
+			} else {
+				t.forgetDocInfo()
+			}
+			t.scheduleReconnect(next)
+			return
 		}
-	}()
+		tail = rememberFrame(tail, message)
+		t.handleMessage(session, message)
+	}
+}
+
+// sessionLifetime is how long Mail.ru lets a coauthoring session live before
+// it sends a socket.io "41" and closes. Measured on both peers at once on
+// 2026-09-20: 63 of 64 sessions ended between 60 and 68 seconds, median 61.
+//
+// renewAfter is when we replace the session ourselves, early enough that the
+// margin covers the spread in that measurement.
+const (
+	sessionLifetime = 61 * time.Second
+	renewAfter      = sessionLifetime - 11*time.Second
+
+	// joinAckTimeout bounds the wait for the server to answer the namespace
+	// join on a replacement connection. It is not a wait for the auth result,
+	// which Mail.ru can delay by half a minute; it is the acknowledgement that
+	// the join was seen at all.
+	joinAckTimeout = 3 * time.Second
+)
+
+// scheduleRenewal arranges to replace this session before the provider kills
+// it.
+//
+// The churn is a schedule, not a fault: every session is cut at about 61
+// seconds. Reacting to the cut means the traffic in flight is lost and the
+// streams inside the tunnel wait out a retransmission timer measured in
+// seconds. Nothing can talk the provider out of the schedule — but a session
+// that is replaced before it is cut never loses anything, because the old one
+// carries traffic until the new one is ready. Break-before-make becomes
+// make-before-break.
+func (t *MailruDocsTransport) scheduleRenewal(session *DocSession) {
+	utils.SafeGo("mailru.renew", func() {
+		timer := time.NewTimer(renewAfter)
+		defer timer.Stop()
+		<-timer.C
+		if !t.IsRunning() || session.superseded.Load() {
+			return
+		}
+		// Only the session still carrying traffic may renew itself. One that
+		// was already replaced, or died and was reconnected, has a successor
+		// whose own timer is running.
+		t.Mu.RLock()
+		current := t.session
+		t.Mu.RUnlock()
+		if current != session {
+			return
+		}
+		t.renewSession(session)
+	})
+}
+
+// renewSession opens a replacement alongside the live one and swaps them over.
+//
+// The old session keeps carrying traffic throughout: it is only retired once
+// the replacement has joined the namespace and been identified. If anything
+// goes wrong the old session is left exactly as it was, which is no worse than
+// not trying — the provider will cut it at its appointed second and the
+// ordinary reconnect path takes over.
+func (t *MailruDocsTransport) renewSession(old *DocSession) {
+	info, err := t.docInfo()
+	if err != nil {
+		utils.Debugf("[M-DOCS] [%s] renewal gave up, document info: %v", t.name(), err)
+		return
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		NetDialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	headers := http.Header{}
+	headers.Set("User-Agent", mailruUserAgent)
+	headers.Set("Origin", "https://docs.datacloudmail.ru")
+
+	conn, _, err := dialer.Dial(info.WsURL, headers)
+	if err != nil {
+		utils.Debugf("[M-DOCS] [%s] renewal gave up, dial: %v", t.name(), err)
+		return
+	}
+
+	// The replacement shares the write queue, so whatever is waiting in it
+	// crosses the handover untouched, and keeps the same identity, so the
+	// provider sees the same participant reconnecting rather than a second one
+	// joining.
+	fresh := &DocSession{
+		Info:       info,
+		Conn:       conn,
+		WriteQueue: old.WriteQueue,
+		UserID:     old.UserID,
+	}
+
+	if !t.awaitOpenPacket(fresh, conn) {
+		utils.Debugf("[M-DOCS] [%s] renewal gave up, no open packet", t.name())
+		conn.Close()
+		return
+	}
+	t.authenticate(fresh, info, fresh.UserID)
+	if !t.awaitJoinAck(fresh, conn) {
+		// Swapping onto a connection the server has not acknowledged would
+		// hand traffic to a session that may never carry it. The old one is
+		// still good for another ten seconds.
+		utils.Debugf("[M-DOCS] [%s] renewal gave up, join not acknowledged", t.name())
+		conn.Close()
+		return
+	}
+
+	// The swap, and the one place this can race: while the replacement was
+	// being prepared the old session may have been cut anyway, and its read
+	// loop may already have started a reconnect. Installing the replacement on
+	// top of that would leave two live sessions on one document. So the swap
+	// only happens if the old session is still the current one and no
+	// reconnect is in flight; otherwise the replacement is thrown away, which
+	// costs nothing — the other path is bringing up a session of its own.
+	t.Mu.Lock()
+	if t.session != old || t.reconnecting.Load() {
+		t.Mu.Unlock()
+		utils.Debugf("[M-DOCS] [%s] renewal dropped, a reconnect got there first", t.name())
+		conn.Close()
+		return
+	}
+	t.session = fresh
+	// Stated rather than assumed: the flag is already true, but the keep-alive
+	// can turn it false if its write lands on the connection we are about to
+	// retire, and nothing on this path would ever turn it back on.
+	t.SetConnected(true)
+	t.Mu.Unlock()
+	// Read the age before the mark is reset, or the line reports zero.
+	age := time.Since(t.ConnectedSince())
+	t.markConnected()
+	old.superseded.Store(true)
+	old.Conn.Close()
+
+	// Said out loud, for the same reason a closure is: these two lines are how
+	// anyone tells a link that is being recycled cleanly from one that keeps
+	// dying. Without it the only evidence a handover happened is the absence
+	// of a closure, which is not evidence anyone can act on.
+	utils.Infof("[%s] session renewed after %.0fs, before the provider could cut it",
+		t.name(), age.Seconds())
+	t.scheduleRenewal(fresh)
+	utils.SafeGo("mailru.read", func() { t.readLoop(fresh, 0) })
+}
+
+// awaitJoinAck reads until the server answers the namespace join, reporting
+// whether it did. Frames arriving meanwhile are handled normally: this
+// connection is not carrying our traffic yet, but the server may already be
+// sending the other participant's.
+func (t *MailruDocsTransport) awaitJoinAck(session *DocSession, conn *websocket.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(joinAckTimeout))
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return false
+		}
+		if isJoinAck(msg) {
+			return true
+		}
+		t.handleMessage(session, msg)
+	}
+}
+
+// isJoinAck reports whether the frame is the server accepting the namespace
+// join: socket.io packet "40", optionally carrying the session id. The
+// goodbye, "41", must not be mistaken for it.
+func isJoinAck(msg []byte) bool {
+	s := string(msg)
+	return s == "40" || strings.HasPrefix(s, "40{")
 }
 
 // openPacketTimeout bounds the wait for the server's Engine.IO open packet.
@@ -626,6 +816,14 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
+				// A write that failed on a session we retired ourselves says
+				// nothing about the link: its replacement is already carrying
+				// traffic. Treating it as a failure would mark a working link
+				// dead, and nothing would mark it live again.
+				if session.superseded.Load() {
+					utils.Debugf("[M-DOCS] [%s] keep-alive hit the retired session, ignoring", t.name())
+					continue
+				}
 				// Marking it disconnected is not enough: nothing acts on that
 				// flag. Close the connection instead, which makes the read
 				// loop return and take its usual reconnect path — one place

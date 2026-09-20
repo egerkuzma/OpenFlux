@@ -3,6 +3,7 @@ package mailru
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // The tail exists to answer one question — what did the server say before it
@@ -91,5 +92,40 @@ func TestIsOpenPacket(t *testing.T) {
 		if isOpenPacket([]byte(other)) {
 			t.Errorf("%q was taken for the open packet", other)
 		}
+	}
+}
+
+// The join acknowledgement decides when a replacement session may take over
+// the traffic. Mistaking the goodbye "41" for it would hand traffic to a
+// connection the server is closing — the exact failure renewal exists to
+// prevent.
+func TestIsJoinAck(t *testing.T) {
+	for _, ok := range []string{"40", `40{"sid":"abc"}`} {
+		if !isJoinAck([]byte(ok)) {
+			t.Errorf("%q was not recognised as the join acknowledgement", ok)
+		}
+	}
+	for _, bad := range []string{
+		"41",                    // the goodbye
+		`41{"reason":"bye"}`,    // the goodbye with a body
+		"4",                     // a bare message packet
+		"2",                     // ping
+		`0{"sid":"abc"}`,        // the Engine.IO open packet
+		`42["message",{"a":1}]`, // an ordinary event
+	} {
+		if isJoinAck([]byte(bad)) {
+			t.Errorf("%q was taken for the join acknowledgement", bad)
+		}
+	}
+}
+
+// Renewal has to happen with enough margin that it beats the provider's cut,
+// which was measured at 60-68 seconds with a median of 61.
+func TestRenewalLeavesMarginBeforeTheCut(t *testing.T) {
+	if renewAfter >= sessionLifetime {
+		t.Fatalf("renewal at %v is not before the cut at %v", renewAfter, sessionLifetime)
+	}
+	if margin := sessionLifetime - renewAfter; margin < 10*time.Second {
+		t.Errorf("margin is %v; the measured sessions varied by eight seconds around the median", margin)
 	}
 }
