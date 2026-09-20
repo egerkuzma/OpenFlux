@@ -27,12 +27,20 @@ struct Profile: Codable {
 
     static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "oneme"]
 
+    /// The documents this profile bonds, one per line in the editor. Several
+    /// of them are what keeps the tunnel up when a provider closes one.
+    var documents: [String] {
+        url.split(whereSeparator: { $0 == "\n" || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     /// A profile is usable once its transport has what it needs: oneme is
-    /// driven by credentials, everything else by a document URL.
+    /// driven by credentials, everything else by at least one document.
     var isComplete: Bool {
         transport == "oneme"
             ? !maxToken.trimmingCharacters(in: .whitespaces).isEmpty
-            : !url.trimmingCharacters(in: .whitespaces).isEmpty
+            : !documents.isEmpty
     }
 }
 
@@ -96,6 +104,10 @@ enum TunnelState: String {
     case disconnected  = "Отключено"
     case connecting    = "Подключаюсь…"
     case connected     = "Подключено"
+    // The tunnel is up but its channel is down: routes and utun stay in place
+    // while the transport reconnects, and saying "connected" here would be a
+    // lie the user can see through — traffic has stopped.
+    case reconnecting  = "Связь потеряна, восстанавливаю…"
     case disconnecting = "Отключаюсь…"
 }
 
@@ -166,6 +178,17 @@ final class TunnelController {
         lock.lock(); defer { lock.unlock() }
         return _state
     }
+
+    /// The tunnel exists — utun is up and the routes are installed — whether
+    /// or not its channel is carrying traffic at this instant. Anything that
+    /// must not leave a running process behind has to test this, not just
+    /// `.connected`.
+    var isActive: Bool {
+        switch state {
+        case .connected, .connecting, .reconnecting, .disconnecting: return true
+        case .disconnected: return false
+        }
+    }
     private var proc: Process? {
         get { lock.lock(); defer { lock.unlock() }; return _proc }
         set { lock.lock(); _proc = newValue; lock.unlock() }
@@ -184,12 +207,14 @@ final class TunnelController {
         guard state == .disconnected else { return }
         requestedStop = false
         setState(.connecting)
-        log.startSession(header: "connect \(p.name) [\(p.transport)] \(Date())")
+        log.startSession(header: "connect \(p.name) [\(p.transport), \(p.documents.count) док.] \(Date())")
 
         var args = ["-n", Store.binaryPath,
                     "--role=client", "--inbound=tun",
-                    "--transport=\(p.transport)",
-                    "--url=\(p.url)"]
+                    "--transport=\(p.transport)"]
+        // One --url per document. Bonding them means a document being closed
+        // by the provider costs one link, not the tunnel.
+        for doc in p.documents { args.append("--url=\(doc)") }
         // Encryption is optional: an empty key file means the flag is omitted,
         // so the transport runs unencrypted. The node must match (also keyless).
         let key = p.keyFile.trimmingCharacters(in: .whitespaces)
@@ -213,8 +238,11 @@ final class TunnelController {
             let d = h.availableData
             guard let self = self, !d.isEmpty else { return }
             self.log.append(d)
-            if let s = String(data: d, encoding: .utf8), s.contains("Tunnel active") {
+            guard let s = String(data: d, encoding: .utf8) else { return }
+            if s.contains("Tunnel active") || s.contains("Transport reconnected") {
                 self.setState(.connected)
+            } else if s.contains("Transport disconnected") {
+                self.setState(.reconnecting)
             }
         }
         proc.terminationHandler = { [weak self] pr in
@@ -237,7 +265,7 @@ final class TunnelController {
     }
 
     func disconnect() {
-        guard state == .connected || state == .connecting else { return }
+        guard state == .connected || state == .connecting || state == .reconnecting else { return }
         requestedStop = true
         setState(.disconnecting)
         DispatchQueue.global().async {
@@ -302,7 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var fProfiles: NSPopUpButton!
     var fName: NSTextField!
     var fTransport: NSPopUpButton!
-    var fURL: NSTextField!
+    var fURL: NSTextView!
     var fKey: NSTextField!
     var fDNS: NSTextField!
     var fToken: NSTextField!
@@ -400,7 +428,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             mi.target = self
             mi.representedObject = p.id.uuidString
             mi.state = (p.id == activeID) ? .on : .off
-            if !p.isComplete { mi.title += " — не настроен" }
+            if !p.isComplete {
+                mi.title += " — не настроен"
+            } else if p.documents.count > 1 {
+                mi.title += "  (\(p.documents.count) док.)"
+            }
             sub.addItem(mi)
         }
         if store.profiles.isEmpty {
@@ -422,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.selected = id
         store.save()
         rebuildProfilesMenu()
-        if ctrl.state == .connected || ctrl.state == .connecting {
+        if ctrl.isActive {
             let a = NSAlert()
             a.messageText = "Профиль переключён"
             a.informativeText = "Туннель сейчас активен. Новый профиль будет использован после переподключения."
@@ -442,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 warn("Профиль не настроен",
                      p.transport == "oneme"
                         ? "Для транспорта oneme нужен maxToken."
-                        : "Укажите ссылку на документ для профиля «\(p.name)».")
+                        : "Укажите хотя бы одну ссылку на документ для профиля «\(p.name)».")
                 return
             }
             ctrl.connect(p)
@@ -466,6 +498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let name: String, color: NSColor
         switch s {
         case .connected:                  name = "circle.fill"; color = .systemGreen
+        case .reconnecting:               name = "circle.fill"; color = .systemOrange
         case .connecting, .disconnecting: name = "circle.fill"; color = .systemYellow
         case .disconnected:               name = "circle";      color = .secondaryLabelColor
         }
@@ -486,6 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         switch s {
         case .disconnected:  toggleItem.title = "Подключить"
         case .connected:     toggleItem.title = "Отключить"; refreshIP()
+        case .reconnecting:  toggleItem.title = "Отключить"
         case .connecting:    toggleItem.title = "Отключить (идёт подключение)"
         case .disconnecting: toggleItem.title = "Отключаюсь…"
         }
@@ -625,7 +659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 440),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = "OpenFlux — профили"
@@ -644,45 +678,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             v.addSubview(f); return f
         }
 
-        label("Профиль:", 396)
-        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 392, width: 280, height: 26))
+        label("Профиль:", 476)
+        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 472, width: 280, height: 26))
         fProfiles.target = self
         fProfiles.action = #selector(switchDraftProfile)
         v.addSubview(fProfiles)
         let add = NSButton(title: "+", target: self, action: #selector(addProfile))
-        add.frame = NSRect(x: 420, y: 392, width: 36, height: 26)
+        add.frame = NSRect(x: 420, y: 472, width: 36, height: 26)
         v.addSubview(add)
         let del = NSButton(title: "−", target: self, action: #selector(deleteProfile))
-        del.frame = NSRect(x: 460, y: 392, width: 36, height: 26)
+        del.frame = NSRect(x: 460, y: 472, width: 36, height: 26)
         v.addSubview(del)
 
-        label("Название:", 356);      fName = field(356)
-        label("Транспорт:", 316)
-        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 312, width: 220, height: 26))
+        label("Название:", 436);  fName = field(436)
+        label("Транспорт:", 396)
+        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 392, width: 220, height: 26))
         fTransport.addItems(withTitles: Profile.transports)
         v.addSubview(fTransport)
-        label("Ссылка (URL):", 276);  fURL = field(276)
-        label("Файл ключа:", 236);    fKey = field(236)
-        label("DNS-сервер:", 196);    fDNS = field(196)
-        label("maxToken:", 156);      fToken = field(156)
-        label("maxUid:", 116);        fUid = field(116)
+
+        // Several documents, one per line: the field has to be multi-line,
+        // because ten of them on a single line is unreadable and unfixable.
+        label("Ссылки:", 336)
+        let urlScroll = NSScrollView(frame: NSRect(x: 132, y: 256, width: 364, height: 100))
+        urlScroll.hasVerticalScroller = true
+        urlScroll.borderType = .bezelBorder
+        let tv = NSTextView(frame: urlScroll.bounds)
+        tv.isEditable = true
+        tv.isRichText = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.autoresizingMask = [.width]
+        urlScroll.documentView = tv
+        v.addSubview(urlScroll)
+        fURL = tv
+
+        let hint = NSTextField(labelWithString: "по одной ссылке в строке — трафик идёт по всем сразу")
+        hint.frame = NSRect(x: 132, y: 236, width: 364, height: 16)
+        hint.textColor = .secondaryLabelColor
+        hint.font = NSFont.systemFont(ofSize: 10)
+        v.addSubview(hint)
+
+        label("Файл ключа:", 200);  fKey = field(200)
+        label("DNS-сервер:", 160);  fDNS = field(160)
+        label("maxToken:", 120);    fToken = field(120)
+        label("maxUid:", 80);       fUid = field(80)
 
         fDebug = NSButton(checkboxWithTitle: "Debug-логи (подробный лог)", target: nil, action: nil)
-        fDebug.frame = NSRect(x: 132, y: 84, width: 320, height: 20)
+        fDebug.frame = NSRect(x: 132, y: 50, width: 320, height: 20)
         v.addSubview(fDebug)
 
         let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Какой профиль использовать — галочкой в меню «Профиль».")
-        note.frame = NSRect(x: 16, y: 52, width: 488, height: 18)
+        note.frame = NSRect(x: 16, y: 28, width: 488, height: 18)
         note.textColor = .secondaryLabelColor
         note.font = NSFont.systemFont(ofSize: 11)
         v.addSubview(note)
 
         let save = NSButton(title: "Сохранить", target: self, action: #selector(saveSettings))
-        save.frame = NSRect(x: 396, y: 14, width: 100, height: 32)
+        save.frame = NSRect(x: 396, y: -2, width: 100, height: 32)
         save.keyEquivalent = "\r"
         v.addSubview(save)
         let cancel = NSButton(title: "Отмена", target: self, action: #selector(closeSettings))
-        cancel.frame = NSRect(x: 300, y: 14, width: 88, height: 32)
+        cancel.frame = NSRect(x: 300, y: -2, width: 88, height: 32)
         v.addSubview(cancel)
 
         settingsWindow = w
@@ -700,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard draft.indices.contains(draftIndex) else { return }
         draft[draftIndex].name = fName.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].transport = fTransport.titleOfSelectedItem ?? draft[draftIndex].transport
-        draft[draftIndex].url = fURL.stringValue.trimmingCharacters(in: .whitespaces)
+        draft[draftIndex].url = fURL.string.trimmingCharacters(in: .whitespacesAndNewlines)
         draft[draftIndex].keyFile = fKey.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].dns = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].maxToken = fToken.stringValue.trimmingCharacters(in: .whitespaces)
@@ -714,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fName.stringValue = p.name
         fTransport.selectItem(withTitle: p.transport)
         if fTransport.selectedItem == nil { fTransport.selectItem(at: 0) }
-        fURL.stringValue = p.url
+        fURL.string = p.url
         fKey.stringValue = p.keyFile
         fDNS.stringValue = p.dns
         fToken.stringValue = p.maxToken
@@ -762,7 +818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.save()
         rebuildProfilesMenu()
         settingsWindow?.close()
-        if ctrl.state == .connected || ctrl.state == .connecting {
+        if ctrl.isActive {
             let a = NSAlert()
             a.messageText = "Профили сохранены"
             a.informativeText = "Туннель сейчас активен. Изменения применятся после переподключения."
@@ -782,7 +838,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func quit() {
-        if ctrl.state == .connected || ctrl.state == .connecting {
+        // Quitting while the channel is down must still tear the tunnel down:
+        // otherwise openflux outlives the app with the routes still installed.
+        if ctrl.isActive {
             ctrl.disconnect()
             usleep(1_500_000)
         }

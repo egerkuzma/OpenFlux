@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	godebug "runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,41 @@ import (
 	"openflux/tunnel"
 	"openflux/utils"
 )
+
+// docURLList collects --url, which may be repeated and may carry several
+// documents separated by commas or whitespace. Each one becomes a link of the
+// bond, so a document being closed by the provider stops mattering.
+type docURLList []string
+
+func (d *docURLList) String() string { return strings.Join(*d, ",") }
+
+func (d *docURLList) Set(v string) error {
+	*d = append(*d, parseDocumentList(v)...)
+	return nil
+}
+
+var docURLs docURLList
+
+// parseDocumentList reads document URLs out of free-form text: one per line,
+// several per line separated by commas or spaces, blank lines skipped, and
+// everything after a '#' treated as a comment. This is what lets a node keep
+// its documents in a file instead of in a command line with ten flags on it.
+func parseDocumentList(content string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		for _, part := range strings.FieldsFunc(line, func(r rune) bool {
+			return r == ',' || r == '\r' || r == '\t' || r == ' '
+		}) {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
 
 var (
 	globalDocUrl string
@@ -95,7 +131,14 @@ func main() {
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 
-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
+	urlFile := flag.String("url-file", "",
+		"Read document URLs from this file, one per line; '#' starts a comment. "+
+			"Equivalent to repeating --url, and far easier to manage for a node "+
+			"running many documents. Combines with --url if both are given")
+	flag.Var(&docURLs, "url",
+		"Document URL. May be repeated, or given several times over as a comma-separated "+
+			"list: every document becomes a link of one bonded channel, so the tunnel "+
+			"survives any single document being closed. Both peers must be given the same set")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
@@ -141,7 +184,13 @@ TRANSPORT
   -t, --transport=cupsonline   Cups.online interview rooms.
   -t, --transport=mailru       Mail.ru Docs over WebSocket.
 
-  -u, --url=<URL>              Document URL.
+  -u, --url=<URL>              Document URL. Repeat it, or pass a comma-separated
+                               list, to bond several documents into one channel:
+                               a document closed by the provider then costs one
+                               link instead of the tunnel. Both peers need the
+                               same set.
+      --url-file=<path>        Read documents from a file, one per line
+                               ('#' comments allowed). Easier than ten flags.
       --maxToken=<token>       MAX auth token (--transport=oneme).
       --maxUid=<uid>           MAX user id   (--transport=oneme).
 
@@ -234,6 +283,23 @@ DEPRECATED (removed in v2)
 		*mode = "l3"
 	}
 
+	if *urlFile != "" {
+		content, err := os.ReadFile(*urlFile)
+		if err != nil {
+			log.Fatalf("--url-file: %v", err)
+		}
+		found := parseDocumentList(string(content))
+		if len(found) == 0 {
+			log.Fatalf("--url-file %s: no document URLs found", *urlFile)
+		}
+		docURLs = append(docURLs, found...)
+		log.Printf("Documents from %s: %d", *urlFile, len(found))
+	}
+	if len(docURLs) == 0 {
+		docURLs = docURLList{"http://#"}
+	}
+	globalDocUrl = docURLs[0]
+
 	if *codec != codecBatched && *codec != codecLegacy {
 		log.Fatalf("--codec: unknown value %q (want batched|legacy)", *codec)
 	}
@@ -285,22 +351,60 @@ DEPRECATED (removed in v2)
 	}
 
 	config := transport.DefaultConfig()
-	var inner transport.Transport
 
-	switch *transportType {
-	case "vyandex":
-		inner = yandex.NewYandexVolgaTransport(globalDocUrl, config)
-	case "yandex":
-		inner = yandex.NewYandexDocsTransport(globalDocUrl, config)
-	case "oneme":
-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
-		inner = oneme.NewOneMeTransport(*role == roleExit, maxToken, uidint, config)
-	case "cupsonline":
-		inner = cupsonline.NewCupsonlineTransport(globalDocUrl, config, *role != roleExit)
-	case "mailru":
-		inner = mailru.NewMailruDocsTransport(globalDocUrl, config)
-	default:
-		log.Fatalf("Unknown transport type: %s", *transportType)
+	// One link per document. The oneme transport is driven by credentials
+	// rather than a URL, so it has nothing to bond.
+	buildLink := func(docURL string) transport.Transport {
+		switch *transportType {
+		case "vyandex":
+			return yandex.NewYandexVolgaTransport(docURL, config)
+		case "yandex":
+			return yandex.NewYandexDocsTransport(docURL, config)
+		case "oneme":
+			uidint, _ := strconv.ParseInt(maxUid, 10, 64)
+			return oneme.NewOneMeTransport(*role == roleExit, maxToken, uidint, config)
+		case "cupsonline":
+			return cupsonline.NewCupsonlineTransport(docURL, config, *role != roleExit)
+		case "mailru":
+			return mailru.NewMailruDocsTransport(docURL, config)
+		default:
+			log.Fatalf("Unknown transport type: %s", *transportType)
+			return nil
+		}
+	}
+
+	if *transportType == "oneme" && len(docURLs) > 1 {
+		log.Fatalf("--transport=oneme takes credentials, not documents: cannot bond %d URLs", len(docURLs))
+	}
+
+	// Held separately: the bond gets wrapped by the codec and the encryption
+	// layers, so by the time anything else sees the transport it is an
+	// *EncryptedTransport and a type assertion for the bond finds nothing.
+	var bond *transport.BondedTransport
+
+	var inner transport.Transport
+	if len(docURLs) == 1 {
+		inner = buildLink(docURLs[0])
+	} else {
+		links := make([]transport.Transport, 0, len(docURLs))
+		for i, u := range docURLs {
+			link := buildLink(u)
+			// Name the link by position, never by URL: a failure has to say
+			// which document dropped, and the URL is effectively the channel's
+			// shared secret — it does not belong in a log that gets pasted
+			// into a chat or an issue.
+			if l, ok := link.(transport.Labeler); ok {
+				l.SetLabel(fmt.Sprintf("документ %d из %d", i+1, len(docURLs)))
+			}
+			links = append(links, link)
+		}
+		bonded, err := transport.NewBondedTransport(links)
+		if err != nil {
+			log.Fatalf("bond documents: %v", err)
+		}
+		bond = bonded
+		inner = bonded
+		log.Printf("Bonded channel: %d documents", len(links))
 	}
 
 	// App-layer codec, outermost. Default is the new batching+zstd layer;
@@ -323,10 +427,7 @@ DEPRECATED (removed in v2)
 		if err != nil {
 			log.Fatalf("Read encryption key file: %v", err)
 		}
-		context := *transportType
-		if globalDocUrl != "" {
-			context = globalDocUrl
-		}
+		context := encryptionContext(*transportType, docURLs)
 		encrypted, err := transport.NewEncryptedTransport(inner, strings.TrimSpace(string(secretBytes)), context, *role == roleExit)
 		if err != nil {
 			log.Fatalf("Configure encrypted transport: %v", err)
@@ -357,20 +458,43 @@ DEPRECATED (removed in v2)
 
 	switch *role {
 	case roleExit:
-		runExit(trans, exitMode)
+		runExit(trans, bond, exitMode)
 	case roleClient:
-		runClient(trans, *inbound, *socksAddr, *dnsServer, exitMode)
+		runClient(trans, bond, *inbound, *socksAddr, *dnsServer, exitMode)
 	default:
 		log.Fatalf("unhandled role %q", *role)
 	}
 }
 
-func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+// encryptionContext derives the key-derivation context both peers must agree
+// on. With a single document it is that URL, unchanged from before bonding
+// existed. With several, the documents are sorted first so the two sides agree
+// even when listed in a different order — links pair up by identity, not by
+// position. A transport with no document falls back to its own name.
+func encryptionContext(transportType string, urls []string) string {
+	switch {
+	case len(urls) == 1 && urls[0] != "":
+		return urls[0]
+	case len(urls) > 1:
+		sorted := append([]string(nil), urls...)
+		sort.Strings(sorted)
+		return strings.Join(sorted, "|")
+	default:
+		return transportType
+	}
+}
+
+func runExit(trans transport.Transport, bond *transport.BondedTransport, exitMode tunnel.ExitMode) {
 	ex, err := tunnel.NewExitNode(trans, exitMode.String())
 	if err != nil {
 		log.Fatalf("exit node: %v", err)
 	}
 	log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
+
+	// The node needs this more than the client does: it runs unattended, and a
+	// bond quietly masks individual documents dying. Without it the journal
+	// would stay silent while links disappeared one by one.
+	go watchTransportHealth(trans, bond)
 	if err := ex.Start(); err != nil {
 		log.Fatalf("exit start: %v", err)
 	}
@@ -393,10 +517,10 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 	select {}
 }
 
-func runClient(trans transport.Transport, inbound, socksAddr, dnsServer string, exitMode tunnel.ExitMode) {
+func runClient(trans transport.Transport, bond *transport.BondedTransport, inbound, socksAddr, dnsServer string, exitMode tunnel.ExitMode) {
 	switch inbound {
 	case inboundTUN:
-		runClientTUN(trans, dnsServer)
+		runClientTUN(trans, bond, dnsServer)
 	case inboundSOCKS5:
 		// Explicit opt-in to the legacy SOCKS5+gVisor client. Kept as a fallback
 		// for platforms without a tun client (see README).
@@ -409,7 +533,68 @@ func runClient(trans transport.Transport, inbound, socksAddr, dnsServer string, 
 	}
 }
 
-func runClientTUN(trans transport.Transport, dnsServer string) {
+// watchTransportHealth reports when the channel underneath the tunnel goes
+// away and comes back.
+//
+// The tunnel itself keeps running across a reconnect — the utun interface and
+// the routes stay up — so without this nothing distinguishes "carrying
+// traffic" from "silently carrying nothing", and the UI goes on claiming the
+// tunnel is fine while it is not.
+func watchTransportHealth(trans transport.Transport, bond *transport.BondedTransport) {
+	// Poll often enough to catch a transition, but only report an outage that
+	// outlasts a reconnect. A dropped channel is usually back in under a
+	// second, and announcing every blip would cry wolf — while a three-second
+	// poll was so coarse that a blip could be reported as an outage and its
+	// recovery noticed long after the fact.
+	const poll = 500 * time.Millisecond
+	const reportAfter = 2 * time.Second
+
+	// A bond hides individual failures on purpose: while one link is up, the
+	// transport never reports itself down. That is exactly what keeps traffic
+	// flowing, and it would otherwise leave the operator blind — four of five
+	// documents could be gone with nothing said. So report the link count as
+	// well, on every change, through the ordinary log rather than the debug
+	// one: it costs a line an hour at worst, and the alternative is enabling
+	// per-packet logging just to learn something operational.
+	bonded := bond != nil
+	lastUp := -1
+	if bonded {
+		lastUp = bond.ConnectedLinks()
+		log.Printf("Bonded links: %d of %d up", lastUp, bond.Len())
+	}
+
+	reported := false
+	var downSince time.Time
+
+	for {
+		time.Sleep(poll)
+
+		if bonded {
+			if up := bond.ConnectedLinks(); up != lastUp {
+				log.Printf("Bonded links: %d of %d up", up, bond.Len())
+				lastUp = up
+			}
+		}
+
+		if trans.IsConnected() {
+			if reported {
+				log.Printf("Transport reconnected")
+				reported = false
+			}
+			downSince = time.Time{}
+			continue
+		}
+		if downSince.IsZero() {
+			downSince = time.Now()
+		}
+		if !reported && time.Since(downSince) >= reportAfter {
+			log.Printf("Transport disconnected, reconnecting")
+			reported = true
+		}
+	}
+}
+
+func runClientTUN(trans transport.Transport, bond *transport.BondedTransport, dnsServer string) {
 	tc, err := NewTUNClient(trans, 1280)
 	if err != nil {
 		log.Fatalf("utun: %v", err)
@@ -450,6 +635,7 @@ func runClientTUN(trans transport.Transport, dnsServer string) {
 			}
 		}
 		log.Printf("Tunnel active")
+		go watchTransportHealth(trans, bond)
 	})
 	watcher.SetProtected(tc.IsProtected)
 	watcher.Start(2 * time.Second)
