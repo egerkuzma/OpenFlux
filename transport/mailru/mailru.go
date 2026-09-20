@@ -363,19 +363,41 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			utils.SafeGo("mailru.writer", t.writerLoop)
 		}
 
-		// Auth - fired immediately, same as the Yandex.Docs transport. No
-		// need to wait for the server's own "0{"/"40" handshake frames
-		// first: Mail.ru's coauthoring server buffers and processes these
-		// once its own session state catches up, and waiting for explicit
-		// acks here only stretches the outage window on every reconnect
-		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
-		// ~30s while it reconciles with the other participant).
+		// Join the namespace only once the server has opened the session.
+		//
+		// Engine.IO has the client wait for the server's "0{sid...}" before
+		// sending "40". We used to send it the moment the socket was up, and
+		// most of the time the server tolerated it — but not always. Reading
+		// back what arrived before each closure showed nine of fourteen
+		// sessions where that open packet was the last thing that ever came:
+		// no namespace acknowledgement, no auth reply, nothing, and then a
+		// polite close. A join the server never saw is the obvious way to end
+		// up in that state.
+		//
+		// This waits for one round trip, not for an auth confirmation —
+		// Mail.ru can delay that by half a minute while it reconciles with
+		// the other participant, which is why the code never waited for it
+		// and still does not.
+		if !t.awaitOpenPacket(session, conn) {
+			// Carrying on is better than dropping the link: this is exactly
+			// what the code did before, and it usually works.
+			utils.Debugf("[M-DOCS] [%s] no open packet in %v, joining anyway", t.name(), openPacketTimeout)
+		}
+
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
 		session.safeWrite(websocket.TextMessage, []byte(auth1))
 
 		session.safeWrite(websocket.TextMessage, []byte(authMessage(info, userID)))
 
 		connectedAt := time.Now()
+		// What arrived just before a close is the only clue to why the
+		// provider closed the session. Everything that is not a ping, an auth
+		// reply or a cursor update is discarded without a word, and the close
+		// itself carries an empty status — gorilla reports that as 1005, "no
+		// status received", which means the server shut the session down
+		// deliberately and politely rather than the connection breaking. If it
+		// says anything first, it says it in a frame we were throwing away.
+		var tail []recentFrame
 		for t.IsRunning() {
 			// Reset before every read: the deadline is absolute, not a
 			// per-call idle timeout.
@@ -386,6 +408,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				// thing anyone asks, so it belongs in the ordinary log rather
 				// than behind --debug.
 				utils.Infof("[%s] connection lost: %v", t.name(), err)
+				reportLastFrames(t.name(), tail)
 				t.SetConnected(false)
 				conn.Close()
 
@@ -401,9 +424,100 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				t.scheduleReconnect(next)
 				return
 			}
+			tail = rememberFrame(tail, message)
 			t.handleMessage(session, message)
 		}
 	}()
+}
+
+// openPacketTimeout bounds the wait for the server's Engine.IO open packet.
+// It is there so a silent server costs a reconnect a few seconds instead of
+// holding it forever; the packet itself arrives within a round trip.
+const openPacketTimeout = 5 * time.Second
+
+// isOpenPacket reports whether the frame is Engine.IO's "open": packet type 0
+// followed by the session's JSON.
+func isOpenPacket(msg []byte) bool {
+	return strings.HasPrefix(string(msg), "0{")
+}
+
+// awaitOpenPacket reads until the server opens the session, reporting whether
+// it did. Frames arriving before it are handled normally rather than dropped —
+// there should be none, and swallowing one would be the same mistake that hid
+// the closures in the first place.
+func (t *MailruDocsTransport) awaitOpenPacket(session *DocSession, conn *websocket.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(openPacketTimeout))
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			// A dead or silent socket. The caller writes anyway and the read
+			// loop reports the failure through the one path that handles it.
+			return false
+		}
+		if isOpenPacket(msg) {
+			return true
+		}
+		t.handleMessage(session, msg)
+	}
+}
+
+// recentFrames is how many of the last frames are kept for the post-mortem:
+// enough to show a goodbye packet and the couple that preceded it.
+const recentFrames = 5
+
+type recentFrame struct {
+	at   time.Time
+	text string
+}
+
+// rememberFrame appends to a bounded tail of what the server sent.
+//
+// Heartbeats are skipped: they arrive constantly and would push everything
+// worth seeing out of the tail. A frame carrying tunnel data is reduced to its
+// size — the payload is the user's traffic, and this log gets pasted into
+// chats and issues, so it must never contain it.
+func rememberFrame(tail []recentFrame, msg []byte) []recentFrame {
+	text := string(msg)
+	switch {
+	case text == "2" || text == "3" || strings.Contains(text, "---KA---"):
+		return tail
+	case strings.Contains(text, "cursor"):
+		text = fmt.Sprintf("<кадр с данными, %d байт>", len(msg))
+	default:
+		text = truncate(text, 300)
+	}
+	tail = append(tail, recentFrame{at: time.Now(), text: text})
+	if len(tail) > recentFrames {
+		tail = tail[len(tail)-recentFrames:]
+	}
+	return tail
+}
+
+// truncate cuts to at most n runes, never mid-character: the frames are JSON
+// with Russian text in them, and a byte-wise cut would produce mojibake in the
+// one line someone reads to find out what happened.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// reportLastFrames says what the server sent before it closed. One line in the
+// ordinary log, because at six closures a minute more than that is noise; the
+// whole tail behind --debug for when the one line is not enough.
+func reportLastFrames(name string, tail []recentFrame) {
+	if len(tail) == 0 {
+		utils.Infof("[%s] before the close: nothing arrived at all", name)
+		return
+	}
+	now := time.Now()
+	last := tail[len(tail)-1]
+	utils.Infof("[%s] before the close, %.1fs earlier: %s", name, now.Sub(last.at).Seconds(), last.text)
+	for _, f := range tail[:len(tail)-1] {
+		utils.Debugf("[M-DOCS] [%s] %.1fs before the close: %s", name, now.Sub(f.at).Seconds(), f.text)
+	}
 }
 
 // authMessage builds the socket.io frame that joins the collaborative editing
@@ -561,7 +675,15 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 
 		t.RecordReceive(len(decoded))
 		t.CallReceive(decoded)
+		return
 	}
+
+	// Anything else used to fall off the end of this function without a word.
+	// Socket.IO has packets the server says goodbye with — "1" for a transport
+	// disconnect, "41" for leaving the namespace — and an error event is an
+	// ordinary message too. Discarding them silently is why every closure has
+	// looked unexplained.
+	utils.Debugf("[M-DOCS] [%s] unhandled frame: %s", t.name(), truncate(text, 300))
 }
 
 func (t *MailruDocsTransport) extractBase64String(response string) string {
