@@ -18,6 +18,13 @@ type fakeLink struct {
 	stopped   bool
 	cb        func([]byte)
 	stagger   time.Duration
+	since     time.Time
+}
+
+func (f *fakeLink) ConnectedSince() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.since
 }
 
 func (f *fakeLink) Start() error {
@@ -386,4 +393,48 @@ func TestBondedStaggerIgnoresPointlessCases(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Sessions are closed a fixed time after they open, so the link that
+// reconnected most recently has the longest left. Switching to it instead of
+// to the next one in rotation roughly halves how often traffic has to move —
+// and every move reorders whatever was still queued on the link being left.
+func TestBondedSwitchesToTheFreshestLink(t *testing.T) {
+	now := time.Now()
+	old := &fakeLink{connected: true, since: now.Add(-50 * time.Second)}
+	fresh := &fakeLink{connected: true, since: now.Add(-2 * time.Second)}
+	middle := &fakeLink{connected: true, since: now.Add(-30 * time.Second)}
+	active := &fakeLink{connected: true, since: now.Add(-60 * time.Second)}
+
+	// Order puts the oldest links first in rotation, so round-robin alone
+	// would pick the wrong one.
+	b, links := bondOf(active, old, middle, fresh)
+
+	b.Send([]byte("first")) // settles on the active link
+	links[0].setConnected(false)
+	b.Send([]byte("after the active link died"))
+
+	if links[3].count() != 1 {
+		t.Errorf("the freshest link carried %d frames, want 1", links[3].count())
+	}
+	if links[1].count() != 0 {
+		t.Errorf("traffic went to the oldest link instead (%d frames)", links[1].count())
+	}
+	if b.ActiveLink() != 4 {
+		t.Errorf("active link is %d, want 4 (the freshest)", b.ActiveLink())
+	}
+}
+
+func TestBondedFallsBackToRotationWithoutAges(t *testing.T) {
+	// A link that cannot report its age must not be excluded, or a transport
+	// without the optional interface would never be chosen.
+	b, links := bondOf(&fakeLink{connected: true}, &fakeLink{connected: true})
+	b.Send([]byte("a"))
+	links[0].setConnected(false)
+	if err := b.Send([]byte("b")); err != nil {
+		t.Fatalf("switch failed: %v", err)
+	}
+	if links[1].count() != 1 {
+		t.Errorf("the remaining link carried %d, want 1", links[1].count())
+	}
 }

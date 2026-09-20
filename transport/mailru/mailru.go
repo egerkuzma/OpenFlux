@@ -92,6 +92,12 @@ type MailruDocsTransport struct {
 	cachedInfo *MailruDocsInfo
 	infoExpiry time.Time
 
+	// connectedAt is when the current session was established. A bond uses it
+	// to pick the freshest link when it has to switch: sessions here live a
+	// fixed time from connection, so the youngest one has the longest left.
+	connectedAtMu sync.Mutex
+	connectedAt   time.Time
+
 	// stagger delays this link's next reconnect once, shifting its phase away
 	// from its siblings in a bond. Consumed on first use: every later cycle
 	// inherits the offset, so it never needs applying twice.
@@ -185,6 +191,19 @@ func jwtExpiry(token string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.Unix(claims.Exp, 0), true
+}
+
+// ConnectedSince implements transport.Freshness.
+func (t *MailruDocsTransport) ConnectedSince() time.Time {
+	t.connectedAtMu.Lock()
+	defer t.connectedAtMu.Unlock()
+	return t.connectedAt
+}
+
+func (t *MailruDocsTransport) markConnected() {
+	t.connectedAtMu.Lock()
+	t.connectedAt = time.Now()
+	t.connectedAtMu.Unlock()
 }
 
 // SetReconnectStagger implements transport.Staggerer.
@@ -320,6 +339,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			t.scheduleReconnect(attempt)
 			return
 		}
+		t.markConnected()
 		utils.Infof("[%s] connected", t.name())
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)

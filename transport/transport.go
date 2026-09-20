@@ -38,6 +38,13 @@ type Staggerer interface {
 	SetReconnectStagger(d time.Duration)
 }
 
+// Freshness is implemented by transports that can say when their current
+// session was established, letting a bond prefer the link with the most life
+// left in it.
+type Freshness interface {
+	ConnectedSince() time.Time
+}
+
 type TransportStats struct {
 	BytesSent     uint64
 	BytesReceived uint64

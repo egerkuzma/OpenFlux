@@ -2,9 +2,12 @@ package transport
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"openflux/utils"
 )
 
 // BondedTransport spreads traffic over several independent channels — in
@@ -140,15 +143,25 @@ func (b *BondedTransport) Send(data []byte) error {
 		}
 	}
 
-	// It is down or refused, so move to the next link that is up.
+	// It is down or refused, so move to another link — preferring the one that
+	// reconnected most recently. Sessions here are closed a fixed time after
+	// they open, so the youngest has the longest left, and picking it roughly
+	// halves how often traffic has to move. That matters because every move
+	// reorders whatever was still queued on the old link, and a long-lived
+	// connection through the tunnel feels each one.
 	var lastErr error
-	for i := 1; i <= n; i++ {
-		idx := (cur + i) % n
+	for _, idx := range b.switchOrder(cur) {
 		if !b.links[idx].IsConnected() {
 			continue
 		}
 		if err := b.links[idx].Send(data); err == nil {
-			b.current.Store(int64(idx))
+			// Worth saying out loud: a switch reorders whatever was still
+			// queued on the old link, and a long-lived connection through the
+			// tunnel feels every one of them. How often this happens is the
+			// number to watch when something upstream keeps dropping.
+			if b.current.Swap(int64(idx)) != int64(idx) {
+				utils.Infof("[bond] traffic moved to link %d of %d", idx+1, n)
+			}
 			return nil
 		} else {
 			lastErr = err
@@ -164,6 +177,41 @@ func (b *BondedTransport) Send(data []byte) error {
 		lastErr = err
 	}
 	return fmt.Errorf("all %d links failed: %w", n, lastErr)
+}
+
+// switchOrder lists the candidate links, freshest first, falling back to
+// round-robin order for links that cannot report their age.
+func (b *BondedTransport) switchOrder(cur int) []int {
+	n := len(b.links)
+	order := make([]int, 0, n)
+	for i := 1; i <= n; i++ {
+		order = append(order, (cur+i)%n)
+	}
+	ages := make(map[int]time.Time, n)
+	known := 0
+	for _, idx := range order {
+		if f, ok := b.links[idx].(Freshness); ok {
+			if t := f.ConnectedSince(); !t.IsZero() {
+				ages[idx] = t
+				known++
+			}
+		}
+	}
+	if known == 0 {
+		return order
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		ti, oki := ages[order[i]]
+		tj, okj := ages[order[j]]
+		if oki != okj {
+			return oki // links of known age come first
+		}
+		if !oki {
+			return false
+		}
+		return ti.After(tj) // most recently connected first
+	})
+	return order
 }
 
 // ActiveLink reports which link currently carries traffic, for diagnostics.
