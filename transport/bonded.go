@@ -10,19 +10,24 @@ import (
 // BondedTransport spreads traffic over several independent channels — in
 // practice several cloud documents — and presents them as one.
 //
-// The point is continuity. A single document's WebSocket is closed by the
-// provider now and then (a plain close, no error), and until it is back the
-// tunnel carries nothing. With a bond, that link simply stops being chosen and
-// the rest keep going; the interruption never reaches the traffic above.
-// Throughput may add up too, but that depends on where the bottleneck is and
-// is not the reason this exists.
+// The point is continuity, and only continuity. A single document's WebSocket
+// is closed by the provider now and then (a plain close, no error), and until
+// it is back the tunnel carries nothing. With a bond, traffic moves to another
+// link and the interruption never reaches the traffic above.
 //
-// This works only because every layer above is per-message: the batching codec
-// frames each message independently and the encryption uses a random nonce per
-// packet rather than a sequence counter. Frames may therefore arrive in any
-// order, which is exactly what several links with different latencies produce.
-// TCP inside the tunnel copes with the reordering, as it does on any multipath
-// network.
+// Traffic is deliberately NOT spread across the links. Spreading was tried and
+// measured, and it cost five to seven times the throughput: 7.5 Mbit/s on one
+// document against 1.0-1.5 on five, reproduced by switching back and forth.
+// The reason is that a frame handed to a link whose session has just died
+// waits in that link's queue for about a second while the other links keep
+// delivering, so the TCP streams inside the tunnel see reordering measured in
+// seconds. TCP reads that as loss and keeps its window shut. Aggregate
+// throughput across parallel streams fell just as far, so this is not merely a
+// single-flow artefact.
+//
+// So one link carries everything until it fails, and the rest are standby.
+// Reordering is then confined to the moment of a switch instead of being
+// continuous.
 //
 // Both peers must be given the same set of documents. They do not have to
 // agree on the order: a frame written to a document is read from that same
@@ -31,7 +36,8 @@ import (
 type BondedTransport struct {
 	links []Transport
 
-	next atomic.Uint64
+	// current is the link carrying traffic; the others stand by.
+	current atomic.Int64
 
 	mu      sync.RWMutex
 	started bool
@@ -109,50 +115,59 @@ func (b *BondedTransport) Stop() error {
 	return firstErr
 }
 
-// Send hands the frame to one link, preferring those currently connected and
-// rotating between them so no single document carries everything.
+// Send gives the frame to the active link, switching only when that link can
+// no longer take it.
 //
-// When nothing is connected the frame still goes to a link rather than being
-// dropped: each link buffers into a queue that survives its own reconnect, and
-// discarding traffic during a reconnect is what makes a sub-second outage look
-// like a multi-second stall to the TCP streams above.
+// Sticking to one link is the whole point: see the type comment for what
+// spreading cost when it was measured. A switch reorders whatever was still
+// queued on the old link, but that happens once per failure rather than once
+// per frame.
 func (b *BondedTransport) Send(data []byte) error {
-	if len(b.links) == 1 {
+	n := len(b.links)
+	if n == 1 {
 		return b.links[0].Send(data)
 	}
 
-	start := b.next.Add(1)
-	n := uint64(len(b.links))
+	cur := int(b.current.Load())
+	if cur < 0 || cur >= n {
+		cur = 0
+	}
 
-	// First pass: connected links only.
+	// The common path: the active link is up and takes the frame.
+	if b.links[cur].IsConnected() {
+		if err := b.links[cur].Send(data); err == nil {
+			return nil
+		}
+	}
+
+	// It is down or refused, so move to the next link that is up.
 	var lastErr error
-	for i := uint64(0); i < n; i++ {
-		l := b.links[(start+i)%n]
-		if !l.IsConnected() {
+	for i := 1; i <= n; i++ {
+		idx := (cur + i) % n
+		if !b.links[idx].IsConnected() {
 			continue
 		}
-		if err := l.Send(data); err == nil {
+		if err := b.links[idx].Send(data); err == nil {
+			b.current.Store(int64(idx))
 			return nil
 		} else {
 			lastErr = err
 		}
 	}
 
-	// Second pass: nothing is connected, or every connected link refused
-	// (a full queue). Let some link buffer it.
-	for i := uint64(0); i < n; i++ {
-		l := b.links[(start+i)%n]
-		if err := l.Send(data); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
+	// Nothing is up. Keep the frame on the active link rather than scattering
+	// it: its queue survives the reconnect, and frames held together stay in
+	// order, which is exactly what spreading them would destroy.
+	if err := b.links[cur].Send(data); err == nil {
+		return nil
+	} else if lastErr == nil {
+		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no usable link")
-	}
-	return fmt.Errorf("all %d links failed: %w", len(b.links), lastErr)
+	return fmt.Errorf("all %d links failed: %w", n, lastErr)
 }
+
+// ActiveLink reports which link currently carries traffic, for diagnostics.
+func (b *BondedTransport) ActiveLink() int { return int(b.current.Load()) + 1 }
 
 // Receive funnels every link into one callback. Frames are self-describing, so
 // the consumer neither knows nor cares which document carried each one.
