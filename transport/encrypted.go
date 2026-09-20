@@ -16,7 +16,16 @@ import (
 const (
 	encryptedVersion = byte(1)
 	encryptedHeader  = 5
-	maxSeenNonces    = 4096
+
+	// maxSeenNonces bounds the replay window. It also decides how far apart
+	// two copies of the same frame may arrive when the bond is mirroring,
+	// because that is the same check that discards the second copy. Nonces are
+	// counted per packet, not per batch: at 20 Mbit/s of 1400-byte packets the
+	// old 4096 covered barely two seconds, and a link whose queue has backed
+	// up can easily be further behind than that. 32768 buys about twenty
+	// seconds for a few megabytes of map, and a wider window only strengthens
+	// the replay check it exists for.
+	maxSeenNonces = 32768
 )
 
 var encryptedMagic = [3]byte{'O', 'F', 'X'}
@@ -117,7 +126,6 @@ func (e *EncryptedTransport) Send(data []byte) error {
 	packet = e.sendAEAD.Seal(packet, nonce, data, header)
 	return e.Transport.Send(packet)
 }
-
 
 func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	e.Transport.Receive(func(packet []byte) {

@@ -438,3 +438,115 @@ func TestBondedFallsBackToRotationWithoutAges(t *testing.T) {
 		t.Errorf("the remaining link carried %d, want 1", links[1].count())
 	}
 }
+
+// Duplication exists because a document that closes loses whatever was in
+// flight without reporting anything: the write succeeded, no queue overflowed.
+// A second copy on another document is what turns that silent loss into a
+// duplicate, which the encryption layer above discards for free.
+func TestBondedMirrorsEveryFrameToASecondLink(t *testing.T) {
+	b, links := bondOf(&fakeLink{connected: true}, &fakeLink{connected: true}, &fakeLink{connected: true})
+	b.MirrorFrames(true)
+
+	for i := 0; i < 20; i++ {
+		if err := b.Send([]byte{byte(i)}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+
+	carrying := 0
+	for i, l := range links {
+		if l.count() == 0 {
+			continue
+		}
+		carrying++
+		if l.count() != 20 {
+			t.Errorf("link %d carried %d of 20 — a copy must be whole, not a share", i+1, l.count())
+		}
+	}
+	if carrying != 2 {
+		t.Errorf("%d links carried traffic, want exactly two (the original and its copy)", carrying)
+	}
+}
+
+// Off unless asked for: it doubles the traffic into the documents, and on a
+// metered connection that is the user's decision, not ours.
+func TestBondedDoesNotMirrorByDefault(t *testing.T) {
+	b, links := bondOf(&fakeLink{connected: true}, &fakeLink{connected: true})
+	if b.Mirroring() {
+		t.Error("duplication must be off until switched on")
+	}
+	b.Send([]byte("only once"))
+
+	if total := links[0].count() + links[1].count(); total != 1 {
+		t.Errorf("%d copies were sent, want 1", total)
+	}
+}
+
+// The copy is worth nothing if it rides a link that is about to expire, so it
+// goes to the freshest one, exactly as a failover does.
+func TestBondedMirrorPicksTheFreshestOtherLink(t *testing.T) {
+	now := time.Now()
+	active := &fakeLink{connected: true, since: now.Add(-60 * time.Second)}
+	old := &fakeLink{connected: true, since: now.Add(-50 * time.Second)}
+	fresh := &fakeLink{connected: true, since: now.Add(-2 * time.Second)}
+
+	b, links := bondOf(active, old, fresh)
+	b.MirrorFrames(true)
+	b.Send([]byte("payload"))
+
+	if links[0].count() != 1 {
+		t.Errorf("the active link carried %d frames, want 1", links[0].count())
+	}
+	if links[2].count() != 1 {
+		t.Errorf("the copy went elsewhere: freshest link carried %d frames, want 1", links[2].count())
+	}
+	if links[1].count() != 0 {
+		t.Errorf("the copy went to the older link instead (%d frames)", links[1].count())
+	}
+}
+
+// A copy is a bonus, never a requirement. With nowhere to put it the frame has
+// still been delivered, so the send must succeed and behave as one link would.
+func TestBondedMirrorFailureDoesNotFailTheSend(t *testing.T) {
+	live := &fakeLink{connected: true}
+	refusing := &fakeLink{connected: true, failSend: true}
+	down := &fakeLink{connected: false}
+
+	b, links := bondOf(live, refusing, down)
+	b.MirrorFrames(true)
+
+	if err := b.Send([]byte("payload")); err != nil {
+		t.Fatalf("send failed although the primary link took the frame: %v", err)
+	}
+	if links[0].count() != 1 {
+		t.Errorf("the primary link carried %d frames, want 1", links[0].count())
+	}
+	if links[2].count() != 0 {
+		t.Errorf("a copy was written to a link that is down (%d frames)", links[2].count())
+	}
+}
+
+// One document has nothing to copy to, and duplicating into itself would only
+// waste the channel.
+func TestBondedMirrorIsANoOpWithOneLink(t *testing.T) {
+	b, links := bondOf(&fakeLink{connected: true})
+	b.MirrorFrames(true)
+	b.Send([]byte("payload"))
+
+	if links[0].count() != 1 {
+		t.Errorf("the only link carried %d frames, want 1", links[0].count())
+	}
+}
+
+// Switched off again, traffic returns to a single link without a restart.
+func TestBondedMirrorCanBeTurnedOff(t *testing.T) {
+	b, links := bondOf(&fakeLink{connected: true}, &fakeLink{connected: true})
+	b.MirrorFrames(true)
+	b.Send([]byte("one"))
+	b.MirrorFrames(false)
+	b.Send([]byte("two"))
+
+	if total := links[0].count() + links[1].count(); total != 3 {
+		t.Errorf("%d sends in total, want 3 (two copies, then one)", total)
+	}
+}

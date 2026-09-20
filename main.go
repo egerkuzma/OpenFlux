@@ -131,6 +131,14 @@ func main() {
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 
+	duplicate := flag.Bool("duplicate", false,
+		"Send every frame down two documents instead of one. A document that closes "+
+			"silently loses whatever was in flight, and the streams inside the tunnel "+
+			"then wait out a retransmission timer measured in seconds; a second copy "+
+			"on another document removes the common case. Costs twice the traffic into "+
+			"the documents. Requires several --url and --encryption-key-file, which is "+
+			"what discards the duplicate. Both peers may set it independently")
+
 	urlFile := flag.String("url-file", "",
 		"Read document URLs from this file, one per line; '#' starts a comment. "+
 			"Equivalent to repeating --url, and far easier to manage for a node "+
@@ -211,6 +219,14 @@ TRANSPORT MODIFIERS
   -c, --codec=legacy           Per-packet LZ4. A/B only.
       --encryption-key-file=<path>
                                AES-256-GCM wrapper. Both peers must share the same key.
+      --duplicate              Write every frame to two documents instead of one.
+                               A closing document silently drops what is in flight,
+                               and the tunnel's TCP then waits out a retransmission
+                               timer measured in seconds; the copy removes the
+                               common case. Costs twice the traffic into the
+                               documents. Needs several --url and an encryption key,
+                               which is what discards the duplicate. Each peer
+                               decides for itself.
 
 BENCHMARK  (only with --role=bench-*)
       --bench-bytes=<MB>       MB to push (bench-send).
@@ -441,6 +457,25 @@ DEPRECATED (removed in v2)
 		}
 		inner = encrypted
 		log.Printf("Transport encryption: AES-256-GCM enabled")
+	}
+
+	// Duplication is switched on last, because it is only safe once we know
+	// the encryption layer is there to discard the second copy. Both
+	// prerequisites are refused loudly rather than quietly ignored: silently
+	// running without duplication would look exactly like running with it,
+	// right up to the next stall.
+	if *duplicate {
+		switch {
+		case bond == nil:
+			log.Fatalf("--duplicate needs at least two documents to copy between")
+		case *encryptionKeyFile == "":
+			log.Fatalf("--duplicate needs --encryption-key-file: the duplicate is " +
+				"discarded by the encryption layer, and without it both copies " +
+				"would be delivered")
+		default:
+			bond.MirrorFrames(true)
+			log.Printf("Frame duplication: on (every frame goes to two documents)")
+		}
 	}
 
 	trans := inner
