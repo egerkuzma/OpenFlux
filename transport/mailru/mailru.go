@@ -573,6 +573,15 @@ func (t *MailruDocsTransport) scheduleRenewalIn(session *DocSession, delay time.
 	})
 }
 
+// Renewal failures are reported in the ordinary log rather than behind --debug.
+//
+// They are rare — the whole point is that renewal normally succeeds — and they
+// are the only warning that a link is drifting towards being aged out. Hidden
+// behind a flag, the first evidence anyone gets is the watchdog line, by which
+// time the session is eighty seconds old, the link has been useless for most of
+// that, and the reason is gone. Measured: three watchdog firings in ten minutes
+// with no way to tell what the renewals had been failing on.
+
 // renewSession opens a replacement alongside the live one and swaps them over.
 //
 // The old session keeps carrying traffic throughout: it is only retired once
@@ -583,7 +592,7 @@ func (t *MailruDocsTransport) scheduleRenewalIn(session *DocSession, delay time.
 func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	info, err := t.docInfo()
 	if err != nil {
-		utils.Debugf("[M-DOCS] [%s] renewal deferred, document info: %v", t.name(), err)
+		utils.Infof("[%s] renewal deferred, document info: %v", t.name(), err)
 		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
@@ -601,7 +610,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 
 	conn, _, err := dialer.Dial(info.WsURL, headers)
 	if err != nil {
-		utils.Debugf("[M-DOCS] [%s] renewal deferred, dial: %v", t.name(), err)
+		utils.Infof("[%s] renewal deferred, dial: %v", t.name(), err)
 		t.scheduleRenewalIn(old, renewRetry)
 		return
 	}
@@ -618,7 +627,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 	}
 
 	if !t.awaitOpenPacket(fresh, conn) {
-		utils.Debugf("[M-DOCS] [%s] renewal deferred, no open packet", t.name())
+		utils.Infof("[%s] renewal deferred, the server sent no handshake", t.name())
 		conn.Close()
 		t.scheduleRenewalIn(old, renewRetry)
 		return
@@ -628,7 +637,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 		// Swapping onto a connection the server has not acknowledged would
 		// hand traffic to a session that may never carry it. The old one is
 		// still good for another ten seconds.
-		utils.Debugf("[M-DOCS] [%s] renewal deferred, join not acknowledged", t.name())
+		utils.Infof("[%s] renewal deferred, the join went unacknowledged", t.name())
 		conn.Close()
 		t.scheduleRenewalIn(old, renewRetry)
 		return
@@ -646,7 +655,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 		t.Mu.Unlock()
 		// No retry here, and only here: the link belongs to another session
 		// now, and that one brought its own timer with it.
-		utils.Debugf("[M-DOCS] [%s] renewal dropped, a reconnect got there first", t.name())
+		utils.Infof("[%s] renewal dropped, a reconnect got there first", t.name())
 		conn.Close()
 		return
 	}

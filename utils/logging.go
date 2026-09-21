@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
+	"time"
 )
 
 var (
@@ -74,4 +76,35 @@ func SafeGo(name string, fn func()) {
 // window.
 func Infof(format string, args ...interface{}) {
 	log.Printf(format, args...)
+}
+
+// Tally counts a repeating event and lets it be reported at most once a
+// second, carrying how many happened in between.
+//
+// It exists because the events worth reporting are exactly the ones that
+// arrive in floods: when the channel below refuses everything, every batch
+// fails, hundreds a second. A line each is unreadable and a line never is
+// what hid these failures in the first place. One line a second with a count
+// says the same thing and can be read.
+//
+// The zero value is ready to use.
+type Tally struct {
+	mu   sync.Mutex
+	n    int
+	last time.Time
+}
+
+// Note records one occurrence and returns how many have accumulated since the
+// last report, or zero when it is not yet time to report.
+func (t *Tally) Note() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.n++
+	if time.Since(t.last) < time.Second {
+		return 0
+	}
+	n := t.n
+	t.n = 0
+	t.last = time.Now()
+	return n
 }

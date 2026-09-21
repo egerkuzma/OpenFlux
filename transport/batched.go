@@ -37,8 +37,31 @@ type BatchedTransport struct {
 
 	running atomic.Bool
 
+	// Two things that used to happen in silence: a batch the channel below
+	// refused, and a batch that arrived but could not be read.
+	dropTally   utils.Tally
+	decodeTally utils.Tally
+
 	mu     sync.RWMutex
 	userCb func([]byte)
+}
+
+// sendBatch hands a batch down and says so when it does not get there.
+//
+// The error was discarded at every call site. The transport below is the bond,
+// which fails only when every link refused at once — the one event worth
+// knowing about — so a whole batch, up to maxBatchCount packets, went missing
+// with no log, no counter and nothing returned to any caller. A search for
+// where frames were being lost concluded that nothing in our code dropped
+// anything, having read a log that could not have said otherwise.
+func (b *BatchedTransport) sendBatch(batch [][]byte) {
+	err := b.Transport.Send(encodeBatch(batch))
+	if err == nil {
+		return
+	}
+	if n := b.dropTally.Note(); n > 0 {
+		utils.Infof("[BATCH] dropped %d batch(es), nothing below would take them: %v", n, err)
+	}
 }
 
 func envInt(name string, def int) int {
@@ -96,7 +119,12 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 	b.Transport.Receive(func(data []byte) {
 		pkts, err := decodeBatch(data)
 		if err != nil {
-			utils.Debugf("[BATCH] decode error (%d bytes): %v", len(data), err)
+			// Silent until now, and the one failure that looks exactly like
+			// the channel going quiet: the frame arrived, was unreadable, and
+			// was dropped without a word.
+			if n := b.decodeTally.Note(); n > 0 {
+				utils.Infof("[BATCH] %d batch(es) arrived unreadable (%d bytes): %v", n, len(data), err)
+			}
 			return
 		}
 		b.mu.RLock()
@@ -127,7 +155,7 @@ func (b *BatchedTransport) flushLoop() {
 			select {
 			case p, ok := <-b.queue:
 				if !ok {
-					b.Transport.Send(encodeBatch(batch))
+					b.sendBatch(batch)
 					return
 				}
 				batch = append(batch, p)
@@ -148,7 +176,7 @@ func (b *BatchedTransport) flushLoop() {
 				case p, ok := <-b.queue:
 					if !ok {
 						timer.Stop()
-						b.Transport.Send(encodeBatch(batch))
+						b.sendBatch(batch)
 						return
 					}
 					batch = append(batch, p)
@@ -160,6 +188,6 @@ func (b *BatchedTransport) flushLoop() {
 			timer.Stop()
 		}
 
-		b.Transport.Send(encodeBatch(batch))
+		b.sendBatch(batch)
 	}
 }
