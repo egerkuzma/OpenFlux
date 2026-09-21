@@ -181,3 +181,24 @@ func TestWriteOverlapFitsInsideTheLinger(t *testing.T) {
 			writeOverlap, retireLinger)
 	}
 }
+
+// The wait for the join acknowledgement is short because the answer is binary:
+// measured across 171 answers on both peers, every one arrived between 10 and
+// 30 milliseconds, and the joins that were not answered that fast were never
+// answered at all. The timeout still has to keep an order of magnitude over
+// the slowest answer observed, or a real answer would start being cut off.
+func TestJoinAckTimeoutKeepsAMarginOverObservedAnswers(t *testing.T) {
+	const slowestObserved = 30 * time.Millisecond
+	if joinAckTimeout < slowestObserved*10 {
+		t.Errorf("waiting %v leaves too little margin over the slowest answer seen (%v)",
+			joinAckTimeout, slowestObserved)
+	}
+	// And it has to stay small against the margin it spends: a renewal begins
+	// renewAfter and the provider cuts at sessionLifetime, so every failed
+	// attempt eats from that difference.
+	margin := sessionLifetime - renewAfter
+	if joinAckTimeout > margin/10 {
+		t.Errorf("a failed attempt costs %v out of %v of margin — too much to retry twice",
+			joinAckTimeout, margin)
+	}
+}

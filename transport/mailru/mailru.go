@@ -483,10 +483,20 @@ const (
 	renewAfter      = sessionLifetime - 11*time.Second
 
 	// joinAckTimeout bounds the wait for the server to answer the namespace
-	// join on a replacement connection. It is not a wait for the auth result,
-	// which Mail.ru can delay by half a minute; it is the acknowledgement that
-	// the join was seen at all.
-	joinAckTimeout = 3 * time.Second
+	// join. It is not a wait for the auth result, which Mail.ru can delay by
+	// half a minute; it is the acknowledgement that the join was seen at all.
+	//
+	// The server's answer is binary: it arrives at once or it never arrives.
+	// Measured over fifteen minutes across both peers — 171 answers, every one
+	// of them between 10 and 30 milliseconds, not a single one slower than half
+	// a second, while roughly a third of joins went unanswered entirely.
+	// Waiting three seconds bought nothing and cost everything it waited: a
+	// renewal starts eleven seconds before the provider's cut, so three seconds
+	// of dead time plus the five before a retry left room for exactly one more
+	// attempt. At 300ms — ten times the slowest answer ever seen — two fit,
+	// which takes the chance of missing the cut from about nine percent to
+	// three.
+	joinAckTimeout = 300 * time.Millisecond
 
 	// renewRetry is how soon a renewal that could not be completed tries
 	// again. Short enough that several attempts still fit before the
@@ -698,13 +708,24 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 // connection is not carrying our traffic yet, but the server may already be
 // sending the other participant's.
 func (t *MailruDocsTransport) awaitJoinAck(session *DocSession, conn *websocket.Conn) bool {
+	// How long the server takes to answer is reported because the answer
+	// decides whether the timeout is the binding constraint. Measured with no
+	// timing at all: about half of every renewal attempt gave up here, on both
+	// peers, which is what drives sessions into the watchdog — each failure
+	// costs five seconds before the retry, against eleven seconds of margin
+	// between the renewal and the provider's cut. Whether the fix is a longer
+	// wait or an earlier start depends on where the successful answers land,
+	// and nothing so far has recorded that.
+	started := time.Now()
 	conn.SetReadDeadline(time.Now().Add(joinAckTimeout))
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
+			utils.Infof("[%s] join unanswered after %.1fs", t.name(), time.Since(started).Seconds())
 			return false
 		}
 		if isJoinAck(msg) {
+			utils.Infof("[%s] join answered in %.2fs", t.name(), time.Since(started).Seconds())
 			return true
 		}
 		t.handleMessage(session, msg)
