@@ -20,15 +20,12 @@ struct Profile: Codable {
     var transport = "mailru"
     var url = ""
     var keyFile = ""
+    /// Only read, never written: the resolver moved to the store. Kept so an
+    /// older saved profile can still be decoded and its value lifted out.
     var dns = ""
     var maxToken = ""
     var maxUid = ""
     var debug = false
-    /// Write every frame to two documents instead of one. A document that
-    /// closes drops whatever was in flight without saying so, and the tunnel's
-    /// TCP then waits out a retransmission timer measured in seconds; the copy
-    /// removes the common case, at twice the traffic into the documents.
-    var duplicate = false
 
     static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "oneme"]
 
@@ -48,6 +45,17 @@ struct Profile: Codable {
             .filter { !$0.isEmpty }
     }
 
+    /// How to describe what this profile carries. cups.online is not counted
+    /// in documents: its single entry is a packed list of rooms the exit node
+    /// made, so "1 док." would be both wrong and confusing.
+    var carriesDescription: String {
+        switch transport {
+        case "cupsonline": return "комнаты ноды"
+        case "oneme":      return "по учётным данным"
+        default:           return "\(documents.count) док."
+        }
+    }
+
     /// A profile is usable once its transport has what it needs: oneme is
     /// driven by credentials, everything else by at least one document.
     var isComplete: Bool {
@@ -62,6 +70,24 @@ struct Store: Codable {
     var profiles: [Profile] = []
     var selected: UUID?
 
+    /// The resolver to use while the tunnel is up.
+    ///
+    /// It lives here rather than in a profile because it describes where the
+    /// exit node is, not how the tunnel reaches it: switching from documents
+    /// to rooms changes the carrier, not which resolver sits behind the far
+    /// end. Kept per profile, every new profile started with an empty field
+    /// and the same address had to be typed again.
+    var dns = ""
+
+    /// Older stores kept the resolver on each profile. Take the first one that
+    /// was filled in, so an upgrade keeps working without being re-entered.
+    mutating func liftDNSFromProfiles() {
+        guard dns.isEmpty else { return }
+        if let found = profiles.first(where: { !$0.dns.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            dns = found.dns.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
     static let key = "store"
     private static let binary = "/usr/local/bin/openflux"
 
@@ -73,7 +99,8 @@ struct Store: Codable {
     static func load() -> Store {
         let d = UserDefaults.standard
         if let data = d.data(forKey: key),
-           let s = try? JSONDecoder().decode(Store.self, from: data), !s.profiles.isEmpty {
+           var s = try? JSONDecoder().decode(Store.self, from: data), !s.profiles.isEmpty {
+            s.liftDNSFromProfiles()
             return s
         }
         return migrateLegacy()
@@ -98,9 +125,9 @@ struct Store: Codable {
         if let v = d.string(forKey: "maxToken") { p.maxToken = v }
         if let v = d.string(forKey: "maxUid") { p.maxUid = v }
         p.debug = d.bool(forKey: "debug")
-        p.duplicate = d.bool(forKey: "duplicate")
 
-        let s = Store(profiles: [p], selected: p.id)
+        var s = Store(profiles: [p], selected: p.id)
+        s.liftDNSFromProfiles()
         s.save()
         return s
     }
@@ -217,11 +244,11 @@ final class TunnelController {
         DispatchQueue.main.async { self.onState?(s) }
     }
 
-    func connect(_ p: Profile) {
+    func connect(_ p: Profile, dns resolver: String) {
         guard state == .disconnected else { return }
         requestedStop = false
         setState(.connecting)
-        log.startSession(header: "connect \(p.name) [\(p.transport), \(p.documents.count) док.] \(Date())")
+        log.startSession(header: "connect \(p.name) [\(p.transport), \(p.carriesDescription)] \(Date())")
 
         var args = ["-n", Store.binaryPath,
                     "--role=client", "--inbound=tun",
@@ -236,22 +263,11 @@ final class TunnelController {
         // A resolver behind the exit node: the client turns the OS's UDP
         // queries into DNS-over-TCP through the tunnel and restores the
         // previous system resolver when it stops.
-        let dns = p.dns.trimmingCharacters(in: .whitespaces)
+        let dns = resolver.trimmingCharacters(in: .whitespaces)
         if !dns.isEmpty { args.append("--dns=\(dns)") }
         if !p.maxToken.isEmpty { args.append("--maxToken=\(p.maxToken)") }
         if !p.maxUid.isEmpty { args.append("--maxUid=\(p.maxUid)") }
         if p.debug { args.append("--debug") }
-        // The binary refuses --duplicate without a second document to copy to
-        // and without the key whose replay window discards the copy. Checking
-        // here keeps a tick in the box from producing a tunnel that exits on
-        // startup; the reason is said out loud rather than swallowed.
-        if p.duplicate {
-            if p.documents.count > 1 && !key.isEmpty {
-                args.append("--duplicate")
-            } else {
-                log.append(Data("дублирование не включено: нужны минимум две ссылки и файл ключа\n".utf8))
-            }
-        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
@@ -355,12 +371,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var fProfiles: NSPopUpButton!
     var fName: NSTextField!
     var fTransport: NSPopUpButton!
+    var fURLLabel: NSTextField!
+    var fURLHint: NSTextField!
     var fURL: NSTextView!
     var fKey: NSTextField!
     var fDNS: NSTextField!
+    var draftDNS = ""
     var fToken: NSTextField!
     var fUid: NSTextField!
-    var fDuplicate: NSButton!
     var fDebug: NSButton!
     /// Profiles being edited; committed to `store` only when Save is pressed.
     var draft: [Profile] = []
@@ -457,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !p.isComplete {
                 mi.title += " — не настроен"
             } else if p.documents.count > 1 {
-                mi.title += "  (\(p.documents.count) док.)"
+                mi.title += "  (\(p.carriesDescription))"
             }
             sub.addItem(mi)
         }
@@ -503,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         : "Укажите хотя бы одну ссылку на документ для профиля «\(p.name)».")
                 return
             }
-            ctrl.connect(p)
+            ctrl.connect(p, dns: store.dns)
         case .connected, .connecting:
             ctrl.disconnect()
         default: break
@@ -676,6 +694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if settingsWindow == nil { buildSettingsWindow() }
         draft = store.profiles
         if draft.isEmpty { draft = [Profile()] }
+        draftDNS = store.dns
         draftIndex = draft.firstIndex(where: { $0.id == store.active?.id }) ?? 0
         reloadProfilePopup()
         loadFields()
@@ -685,7 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 552),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 600),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = "OpenFlux — профили"
@@ -704,28 +723,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             v.addSubview(f); return f
         }
 
-        label("Профиль:", 508)
-        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 504, width: 280, height: 26))
+        label("Профиль:", 556)
+        fProfiles = NSPopUpButton(frame: NSRect(x: 132, y: 552, width: 280, height: 26))
         fProfiles.target = self
         fProfiles.action = #selector(switchDraftProfile)
         v.addSubview(fProfiles)
         let add = NSButton(title: "+", target: self, action: #selector(addProfile))
-        add.frame = NSRect(x: 420, y: 504, width: 36, height: 26)
+        add.frame = NSRect(x: 420, y: 552, width: 36, height: 26)
         v.addSubview(add)
         let del = NSButton(title: "−", target: self, action: #selector(deleteProfile))
-        del.frame = NSRect(x: 460, y: 504, width: 36, height: 26)
+        del.frame = NSRect(x: 460, y: 552, width: 36, height: 26)
         v.addSubview(del)
 
-        label("Название:", 468);  fName = field(468)
-        label("Транспорт:", 428)
-        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 424, width: 220, height: 26))
+        label("Название:", 516);  fName = field(516)
+        label("Транспорт:", 476)
+        fTransport = NSPopUpButton(frame: NSRect(x: 132, y: 472, width: 220, height: 26))
         fTransport.addItems(withTitles: Profile.transports)
+        fTransport.target = self
+        fTransport.action = #selector(transportChanged)
         v.addSubview(fTransport)
 
         // Several documents, one per line: the field has to be multi-line,
         // because ten of them on a single line is unreadable and unfixable.
-        label("Ссылки:", 368)
-        let urlScroll = NSScrollView(frame: NSRect(x: 132, y: 288, width: 364, height: 100))
+        // The label and the hint below it are set from the transport: for
+        // cups.online this field is not a list of documents at all.
+        fURLLabel = NSTextField(labelWithString: "Ссылки:")
+        fURLLabel.frame = NSRect(x: 16, y: 416, width: 110, height: 20)
+        fURLLabel.alignment = .right
+        v.addSubview(fURLLabel)
+        let urlScroll = NSScrollView(frame: NSRect(x: 132, y: 336, width: 364, height: 100))
         urlScroll.hasVerticalScroller = true
         urlScroll.borderType = .bezelBorder
         let tv = NSTextView(frame: urlScroll.bounds)
@@ -738,26 +764,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         v.addSubview(urlScroll)
         fURL = tv
 
-        let hint = NSTextField(labelWithString: "по одной ссылке в строке — трафик идёт по всем сразу")
-        hint.frame = NSRect(x: 132, y: 268, width: 364, height: 16)
-        hint.textColor = .secondaryLabelColor
-        hint.font = NSFont.systemFont(ofSize: 10)
-        v.addSubview(hint)
+        fURLHint = NSTextField(labelWithString: "")
+        fURLHint.frame = NSRect(x: 132, y: 310, width: 364, height: 28)
+        fURLHint.textColor = .secondaryLabelColor
+        fURLHint.font = NSFont.systemFont(ofSize: 10)
+        fURLHint.maximumNumberOfLines = 2
+        fURLHint.lineBreakMode = .byWordWrapping
+        v.addSubview(fURLHint)
 
-        label("Файл ключа:", 232);  fKey = field(232)
-        label("DNS-сервер:", 192);  fDNS = field(192)
-        label("maxToken:", 152);    fToken = field(152)
-        label("maxUid:", 112);      fUid = field(112)
+        label("Файл ключа:", 280);  fKey = field(280)
+        label("maxToken:", 240);    fToken = field(240)
+        label("maxUid:", 200);      fUid = field(200)
 
-        fDuplicate = NSButton(checkboxWithTitle: "Дублировать кадры по двум документам", target: nil, action: nil)
-        fDuplicate.frame = NSRect(x: 132, y: 76, width: 364, height: 20)
-        v.addSubview(fDuplicate)
+        // Below the profile fields: this one belongs to the machine, not to
+        // any profile, and the separator says so.
+        let sep = NSBox(frame: NSRect(x: 16, y: 160, width: 480, height: 1))
+        sep.boxType = .separator
+        v.addSubview(sep)
+        label("DNS-сервер:", 128);  fDNS = field(128)
+        let dnsHint = NSTextField(labelWithString:
+            "общий для всех профилей. Пусто — системный резолвер не трогаем, всё как обычно")
+        dnsHint.frame = NSRect(x: 132, y: 108, width: 364, height: 16)
+        dnsHint.textColor = .secondaryLabelColor
+        dnsHint.font = NSFont.systemFont(ofSize: 10)
+        v.addSubview(dnsHint)
 
         fDebug = NSButton(checkboxWithTitle: "Debug-логи (подробный лог)", target: nil, action: nil)
         fDebug.frame = NSRect(x: 132, y: 50, width: 320, height: 20)
         v.addSubview(fDebug)
 
-        let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Дублирование требует двух ссылок и ключа, трафика в документы вдвое больше.")
+        let note = NSTextField(labelWithString: "Ключ и DNS необязательны. Оба поля можно оставить пустыми.")
+        note.toolTip = "Поле DNS подменяет системный резолвер, пока туннель поднят, и возвращает прежний при выходе. "
+            + "Само по себе разрешение имён через туннель работает и без него: туннель несёт только TCP, "
+            + "поэтому запросы к UDP:53, попадающие в него, переспрашиваются по TCP в любом случае."
         note.frame = NSRect(x: 16, y: 28, width: 488, height: 18)
         note.textColor = .secondaryLabelColor
         note.font = NSFont.systemFont(ofSize: 11)
@@ -774,6 +813,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settingsWindow = w
     }
 
+    /// cups.online does not take documents: the exit node creates its own
+    /// rooms at startup and prints one packed string for the client to use.
+    /// Asking for links there would be asking for something that does not
+    /// exist until the node has run, so the field means a different thing and
+    /// has to say so.
+    @objc private func transportChanged() {
+        let cups = (fTransport.titleOfSelectedItem == "cupsonline")
+        fURLLabel.stringValue = cups ? "Комнаты:" : "Ссылки:"
+        fURLHint.stringValue = cups
+            ? "строку комнат печатает нода при запуске — скопируйте её оттуда целиком"
+            : "по одной ссылке в строке; тот же набор должен стоять на ноде"
+    }
+
     private func reloadProfilePopup() {
         fProfiles.removeAllItems()
         for p in draft { fProfiles.addItem(withTitle: p.name.isEmpty ? "(без имени)" : p.name) }
@@ -788,11 +840,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         draft[draftIndex].transport = fTransport.titleOfSelectedItem ?? draft[draftIndex].transport
         draft[draftIndex].url = fURL.string.trimmingCharacters(in: .whitespacesAndNewlines)
         draft[draftIndex].keyFile = fKey.stringValue.trimmingCharacters(in: .whitespaces)
-        draft[draftIndex].dns = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].maxToken = fToken.stringValue.trimmingCharacters(in: .whitespaces)
         draft[draftIndex].maxUid = fUid.stringValue.trimmingCharacters(in: .whitespaces)
-        draft[draftIndex].duplicate = (fDuplicate.state == .on)
         draft[draftIndex].debug = (fDebug.state == .on)
+        // Not part of the profile being edited: one value for all of them.
+        draftDNS = fDNS.stringValue.trimmingCharacters(in: .whitespaces)
     }
 
     private func loadFields() {
@@ -801,12 +853,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fName.stringValue = p.name
         fTransport.selectItem(withTitle: p.transport)
         if fTransport.selectedItem == nil { fTransport.selectItem(at: 0) }
+        transportChanged()
         fURL.string = p.url
         fKey.stringValue = p.keyFile
-        fDNS.stringValue = p.dns
         fToken.stringValue = p.maxToken
         fUid.stringValue = p.maxUid
-        fDuplicate.state = p.duplicate ? .on : .off
+        fDNS.stringValue = draftDNS
         fDebug.state = p.debug ? .on : .off
     }
 
@@ -845,6 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let previous = store.selected
         store.profiles = draft
+        store.dns = draftDNS
         // Keep the selection if it still exists, otherwise fall back.
         store.selected = draft.contains(where: { $0.id == previous }) ? previous : draft.first?.id
         store.save()

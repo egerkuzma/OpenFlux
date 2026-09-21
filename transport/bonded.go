@@ -42,9 +42,6 @@ type BondedTransport struct {
 	// current is the link carrying traffic; the others stand by.
 	current atomic.Int64
 
-	// mirror duplicates every frame onto a second link. See mirrorFrame.
-	mirror atomic.Bool
-
 	mu      sync.RWMutex
 	started bool
 }
@@ -148,7 +145,6 @@ func (b *BondedTransport) Send(data []byte) error {
 	// The common path: the active link is up and takes the frame.
 	if b.links[cur].IsConnected() {
 		if err := b.links[cur].Send(data); err == nil {
-			b.mirrorFrame(data, cur)
 			return nil
 		}
 	}
@@ -172,7 +168,6 @@ func (b *BondedTransport) Send(data []byte) error {
 			if b.current.Swap(int64(idx)) != int64(idx) {
 				utils.Infof("[bond] traffic moved to link %d of %d", idx+1, n)
 			}
-			b.mirrorFrame(data, idx)
 			return nil
 		} else {
 			lastErr = err
@@ -188,51 +183,6 @@ func (b *BondedTransport) Send(data []byte) error {
 		lastErr = err
 	}
 	return fmt.Errorf("all %d links failed: %w", n, lastErr)
-}
-
-// MirrorFrames turns duplication on or off. It requires the encryption layer
-// above the bond: see mirrorFrame for why.
-func (b *BondedTransport) MirrorFrames(on bool) { b.mirror.Store(on) }
-
-// Mirroring reports whether frames are being duplicated.
-func (b *BondedTransport) Mirroring() bool { return b.mirror.Load() }
-
-// mirrorFrame writes a second copy of the frame to another live link.
-//
-// A document's channel does not buffer. A frame written to it while the peer
-// is detached is simply gone, and nothing below notices: the write itself
-// succeeds, no queue overflows, no error is returned. So whatever was in
-// flight when a link dropped is lost, and recovering it falls to the TCP
-// streams inside the tunnel, whose retransmission timer counts in whole
-// seconds. Measured on both ends at once: three of five links dropped
-// together and the download froze for 27 seconds, although every link was
-// back within one, and the frozen period showed only TCP's retransmission
-// trickle.
-//
-// Writing the same frame to a second document turns that loss into a
-// duplicate, and a duplicate costs nothing: the encryption layer already drops
-// a frame whose nonce it has seen, so the copy that arrives second is
-// discarded before anything above it looks. Without encryption there is no
-// such check and duplication must stay off.
-//
-// This does not make loss impossible — the two documents can die together, as
-// those three did — but it removes the common case of one link dropping.
-//
-// The copy goes to the freshest other link, for the same reason a switch
-// prefers it. Errors are ignored on purpose: the frame has already been
-// delivered by the primary link, so a failed copy leaves us exactly where a
-// single link would have.
-func (b *BondedTransport) mirrorFrame(data []byte, primary int) {
-	if !b.mirror.Load() {
-		return
-	}
-	for _, idx := range b.switchOrder(primary) {
-		if idx == primary || !b.links[idx].IsConnected() {
-			continue
-		}
-		_ = b.links[idx].Send(data)
-		return
-	}
 }
 
 // switchOrder lists the candidate links, freshest first, falling back to

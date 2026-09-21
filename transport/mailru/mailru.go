@@ -531,8 +531,10 @@ const (
 	//
 	// Waiting for the confirmation is not available, so both sessions are
 	// written to for a moment instead and whichever the server honours
-	// delivers. The copy is free for the same reason frame duplication was:
-	// the replay window above discards whatever arrives twice. It is the
+	// delivers. The copy costs nothing because the encryption layer's replay
+	// window discards a frame whose nonce it has already seen — without that
+	// window this overlap would deliver every frame twice, so it must not be
+	// used on an unencrypted channel. It is the
 	// mirror of retireLinger — that one keeps reading the old session, this
 	// one keeps writing to it — and is kept shorter so it never writes to a
 	// connection that has already been closed.
