@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -45,8 +46,10 @@ type CupsonlineConfig struct {
 
 	SendQueueSize int
 
-	ReadBufferSize  int
-	WriteBufferSize int
+	// MaxMessageBytes bounds one incoming websocket message. It used to size
+	// the dialler's buffers as well, which is why it was measured in tens of
+	// megabytes; as a ceiling on a single message that is simply generous.
+	MaxMessageBytes int
 
 	MaxPayloadBytes int
 
@@ -74,8 +77,7 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 
 		SendQueueSize: 65536,
 
-		ReadBufferSize:  32 << 20,
-		WriteBufferSize: 32 << 20,
+		MaxMessageBytes: 32 << 20,
 
 		MaxPayloadBytes: 16_000_000,
 
@@ -365,10 +367,23 @@ func (w *cupsWS) connectAndServe() error {
 		header.Add("Cookie", c.Name+"="+c.Value)
 	}
 
+	// Dialled the way mailru dials, which is the transport that works.
+	//
+	// The connect timeout and the TCP keepalive were missing entirely: without
+	// the first a stuck connect waits on the operating system's own timeout,
+	// tens of seconds, and without the second a connection whose far end has
+	// gone silent is never noticed by the kernel at all.
+	//
+	// The buffers were 32 MB each, per connection, four connections — a
+	// quarter of a gigabyte reserved for a channel that carries a few hundred
+	// kilobytes a second. mailru leaves them at the library's default and runs
+	// thirty times faster, so the size was never what made the difference.
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
-		ReadBufferSize:   w.config.ReadBufferSize,
-		WriteBufferSize:  w.config.WriteBufferSize,
+		NetDialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
 	conn, _, err := dialer.Dial(wsURL, header)
 	if err != nil {
@@ -384,7 +399,7 @@ func (w *cupsWS) connectAndServe() error {
 		conn.Close()
 	}()
 
-	conn.SetReadLimit(int64(w.config.ReadBufferSize))
+	conn.SetReadLimit(int64(w.config.MaxMessageBytes))
 
 	if err := w.writeJSON(map[string]interface{}{
 		"id": 1, "connect": map[string]interface{}{"token": w.auth.connToken, "name": "js"},
