@@ -56,12 +56,15 @@ func TestARepeatedFrameIsDeliveredOnce(t *testing.T) {
 	}
 
 	// Wait for the batching layer to flush rather than guessing at a sleep.
+	// Through lastSent, because that flush happens on the codec's own
+	// goroutine: reading the field directly is a data race, and the race
+	// detector fails the whole package over it.
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && len(wire.sent) == 0 {
+	for time.Now().Before(deadline) && len(wire.lastSent()) == 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(60 * time.Millisecond)
-	frame := append([]byte(nil), wire.sent...)
+	frame := wire.lastSent()
 	if len(frame) == 0 {
 		t.Fatal("ничего не дошло до провода за две секунды")
 	}

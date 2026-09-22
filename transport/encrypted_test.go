@@ -2,23 +2,49 @@ package transport
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
+// testTransport is written by whatever goroutine the layer above happens to
+// flush on — BatchedTransport has one of its own — and read by the test. The
+// mutex is what makes that safe; without it the race detector fails the whole
+// package, which is how CI found this.
 type testTransport struct {
+	mu       sync.Mutex
 	receiver func([]byte)
 	sent     []byte
 }
 
-func (t *testTransport) Start() error                  { return nil }
-func (t *testTransport) Stop() error                   { return nil }
-func (t *testTransport) IsConnected() bool             { return true }
-func (t *testTransport) Stats() TransportStats         { return TransportStats{} }
-func (t *testTransport) Receive(callback func([]byte)) { t.receiver = callback }
-func (t *testTransport) Send(data []byte) error        { t.sent = append([]byte(nil), data...); return nil }
+func (t *testTransport) Start() error          { return nil }
+func (t *testTransport) Stop() error           { return nil }
+func (t *testTransport) IsConnected() bool     { return true }
+func (t *testTransport) Stats() TransportStats { return TransportStats{} }
+func (t *testTransport) Receive(callback func([]byte)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.receiver = callback
+}
+func (t *testTransport) Send(data []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sent = append([]byte(nil), data...)
+	return nil
+}
+
+// lastSent returns a copy, so the caller cannot read the slice while the next
+// send replaces it.
+func (t *testTransport) lastSent() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.sent...)
+}
 func (t *testTransport) deliver(data []byte) {
-	if t.receiver != nil {
-		t.receiver(data)
+	t.mu.Lock()
+	r := t.receiver
+	t.mu.Unlock()
+	if r != nil {
+		r(data)
 	}
 }
 

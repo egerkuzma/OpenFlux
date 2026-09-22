@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -143,7 +144,10 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	// JoinHostPort, not Sprintf: an IPv6 literal has to be bracketed or the
+	// result is not an address at all. The stack is IPv4-only today, so this
+	// never fired — it was simply waiting for the day it stopped being.
+	dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
 	var wq waiter.Queue
 	ep, tErr := r.CreateEndpoint(&wq)
