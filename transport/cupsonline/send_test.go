@@ -128,3 +128,19 @@ func TestSpreadingOffPinsEverythingToOneRoom(t *testing.T) {
 		t.Errorf("закреплённая комната несёт %d батчей из 20", carried)
 	}
 }
+
+// Starting twice used to append a second set of channels and launch a second
+// stats loop over counters sized for the first, which panicked with an index
+// out of range as soon as it ticked. A probe found it; in production a wrapper
+// that starts what it wraps would have.
+func TestStartingTwiceDoesNotDoubleTheChannels(t *testing.T) {
+	tr, _ := testChannels(4)
+	tr.started.Store(true) // как будто уже поднят
+
+	if err := tr.Start(); err != nil {
+		t.Fatalf("повторный запуск вернул ошибку: %v", err)
+	}
+	if got := len(tr.wss); got != 4 {
+		t.Errorf("каналов стало %d вместо 4 — комплект задвоился", got)
+	}
+}

@@ -653,7 +653,8 @@ type CupsonlineTransport struct {
 	auths []*cupsAuth
 	wss   []*cupsWS
 
-	nextWS atomic.Uint64
+	nextWS  atomic.Uint64
+	started atomic.Bool
 
 	stopCh     chan struct{}
 	statsStart time.Time
@@ -703,7 +704,17 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 	return t
 }
 
+// Start is safe to call twice, and had to be made so. A second call used to
+// append a second full set of channels to the same slice and launch a second
+// stats loop; the first loop had sized its counters from the old length and
+// panicked with an index out of range the moment it woke up. Nothing in the
+// production path starts a transport twice, but a wrapper layer that starts
+// what it wraps does, and a panic in a stats goroutine takes the tunnel with it.
 func (t *CupsonlineTransport) Start() error {
+	if !t.started.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	if t.clientErr != nil {
 		return t.clientErr
 	}

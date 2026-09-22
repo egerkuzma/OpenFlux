@@ -41,6 +41,7 @@ type BatchedTransport struct {
 	// refused, and a batch that arrived but could not be read.
 	dropTally   utils.Tally
 	decodeTally utils.Tally
+	queueTally  utils.Tally
 
 	mu     sync.RWMutex
 	userCb func([]byte)
@@ -98,8 +99,17 @@ func (b *BatchedTransport) Stop() error {
 }
 
 // Send copies the packet (the caller's buffer is reused by gVisor) and enqueues
-// it for batching. A full queue drops the packet; the tunnel's TCP will
-// retransmit, same as the old "write queue full" behavior.
+// it for batching. A full queue drops the packet and the tunnelled TCP
+// retransmits, which is how a router signals congestion and is the right
+// behaviour — but it is also a loss, and loss is what a TCP reacts to by
+// halving its window.
+//
+// It used to be silent. The only trace was an error the tunnel wrote with
+// Debugf, so in ordinary operation the one place we drop traffic on purpose
+// reported nothing at all, and a measurement showing the channel carrying
+// 8.5 Mbit/s while the tunnel on top of it delivered 3.2 had nowhere to look.
+// Counted and reported at most once a second, the number says plainly whether
+// the queue is where throughput is going.
 func (b *BatchedTransport) Send(data []byte) error {
 	p := make([]byte, len(data))
 	copy(p, data)
@@ -107,6 +117,9 @@ func (b *BatchedTransport) Send(data []byte) error {
 	case b.queue <- p:
 		return nil
 	default:
+		if n := b.queueTally.Note(); n > 0 {
+			utils.Infof("[BATCH] queue full, %d packet(s) dropped — the channel below is slower than the traffic above", n)
+		}
 		return fmt.Errorf("batch queue full")
 	}
 }
