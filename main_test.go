@@ -108,3 +108,37 @@ func TestParseDocumentListEdgeCases(t *testing.T) {
 		}
 	}
 }
+
+// The salt has to be computable identically by both peers, and for cups.online
+// it cannot come from documents: the exit node creates its rooms at startup and
+// the client is handed them afterwards, so the exit has no list and the client
+// has the packed one. Built from urls the two derive different keys and neither
+// can read the other — a second wall standing behind the first, invisible until
+// the channel itself works.
+func TestEncryptionContextIgnoresDocumentsWherePeersCannotShareThem(t *testing.T) {
+	rooms := "WyJhYmMiLCJkZWYiXQ"
+
+	client := encryptionContext("cupsonline", []string{rooms})
+	exit := encryptionContext("cupsonline", nil)
+	if client != exit {
+		t.Errorf("клиент получил %q, нода %q — расшифровать друг друга они не смогут", client, exit)
+	}
+
+	// Same for a transport driven by credentials.
+	if a, b := encryptionContext("oneme", []string{"anything"}), encryptionContext("oneme", nil); a != b {
+		t.Errorf("oneme: %q против %q", a, b)
+	}
+}
+
+// And the transports that do share a list must keep deriving from it: changing
+// their salt would silently break every existing pair.
+func TestEncryptionContextStillUsesDocumentsWherePeersShareThem(t *testing.T) {
+	for _, tr := range []string{"mailru", "yandex", "vyandex"} {
+		if got := encryptionContext(tr, []string{"https://a"}); got != "https://a" {
+			t.Errorf("%s: контекст стал %q вместо ссылки", tr, got)
+		}
+		if got := encryptionContext(tr, []string{"https://b", "https://a"}); got != "https://a|https://b" {
+			t.Errorf("%s: несколько ссылок дали %q", tr, got)
+		}
+	}
+}

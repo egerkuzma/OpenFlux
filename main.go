@@ -479,7 +479,31 @@ DEPRECATED (removed in v2)
 // existed. With several, the documents are sorted first so the two sides agree
 // even when listed in a different order — links pair up by identity, not by
 // position. A transport with no document falls back to its own name.
+// sharesDocuments says whether both peers of a transport hold the same list of
+// documents. It decides what the encryption context may be built from.
+//
+// For Mail.ru and the Yandex transports the operator gives both sides the same
+// links, so the links identify the channel and make a good salt. cups.online is
+// the other kind: the exit node creates its rooms at startup and the client is
+// handed them afterwards, so the two sides never hold the same thing — the exit
+// has no list at all and the client has the packed one. A context built from
+// urls therefore cannot match, by construction, and each peer derives a key the
+// other cannot use. oneme is driven by credentials and has the same problem.
+var sharesDocuments = map[string]bool{
+	"mailru": true, "yandex": true, "vyandex": true,
+	"cupsonline": false, "oneme": false,
+}
+
+// encryptionContext returns the salt both peers must agree on.
+//
+// It is only a salt — the secrecy is in the shared key file — but the two sides
+// must compute it identically or neither can read the other.
 func encryptionContext(transportType string, urls []string) string {
+	// Whatever the client was given, a transport whose peers do not share a
+	// document list has exactly one thing they both always know: its name.
+	if !sharesDocuments[transportType] {
+		return transportType
+	}
 	switch {
 	case len(urls) == 1 && urls[0] != "":
 		return urls[0]
