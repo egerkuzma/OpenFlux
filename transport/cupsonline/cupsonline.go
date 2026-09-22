@@ -6,11 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -85,6 +85,20 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		StatsInterval: 5 * time.Second,
 	}
 }
+
+// cupsSpread is off by default, and measurement is why. Sending a flow's
+// packets down four sockets of differing latency reorders them, and TCP counts
+// reordering as loss: on the same channel, minutes apart, one stream ran at
+// 0.49 Mbit/s spread over four rooms and 3.25 Mbit/s pinned to one — six and a
+// half times faster for doing less. Pinned, four streams total what one does
+// (3.17 against 3.25), so the limit is now the room's own capacity rather than
+// a collapsed congestion window.
+//
+// The rooms are not wasted, they are waiting: capacity multiplies only once
+// each flow keeps to one room, and the flow is invisible here because a codec
+// sits above and hands down batches. OPENFLUX_CUPS_SPREAD=1 restores the old
+// behaviour for measuring against.
+var cupsSpread = os.Getenv("OPENFLUX_CUPS_SPREAD") == "1"
 
 var (
 	reMetaConnToken = regexp.MustCompile(`<meta[^>]+name="centrifuge-connection-token"[^>]+content="([^"]+)"`)
@@ -270,7 +284,6 @@ type channelStats struct {
 	batchesSent atomic.Uint64
 	batchesRecv atomic.Uint64
 	reconnects  atomic.Uint64
-	flows       atomic.Uint64
 }
 
 // ---- WS ----
@@ -379,18 +392,23 @@ func (w *cupsWS) connectAndServe() error {
 		return err
 	}
 	conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
-	if _, _, err := conn.ReadMessage(); err != nil {
+	_, connectReply, err := conn.ReadMessage()
+	if err != nil {
 		return err
 	}
+	utils.Debugf("[CUPS] connect reply (%s): %s", w.auth.roomUUID, connectReply)
+
 	if err := w.writeJSON(map[string]interface{}{
 		"id": 2, "subscribe": map[string]interface{}{"channel": w.auth.channel, "token": w.auth.subToken},
 	}); err != nil {
 		return err
 	}
 	conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
-	if _, _, err := conn.ReadMessage(); err != nil {
+	_, subscribeReply, err := conn.ReadMessage()
+	if err != nil {
 		return err
 	}
+	utils.Debugf("[CUPS] subscribe reply (%s): %s", w.auth.roomUUID, subscribeReply)
 	w.connected.Store(true)
 	utils.Debugf("[CUPS] WS ready: %s", w.auth.roomUUID)
 
@@ -606,19 +624,6 @@ func (w *cupsWS) Send(data []byte) error {
 	}
 }
 
-// ---- flow key ----
-
-type flowKey struct {
-	srcIP, dstIP     uint32
-	srcPort, dstPort uint16
-	proto            uint8
-}
-
-type flowSender struct {
-	seq   atomic.Uint64
-	chIdx int
-}
-
 // ---- Transport ----
 
 type CupsonlineTransport struct {
@@ -633,8 +638,7 @@ type CupsonlineTransport struct {
 	auths []*cupsAuth
 	wss   []*cupsWS
 
-	flowMu sync.RWMutex
-	flows  map[flowKey]*flowSender
+	nextWS atomic.Uint64
 
 	stopCh     chan struct{}
 	statsStart time.Time
@@ -645,7 +649,6 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 		BaseTransport: transport.NewBaseTransport(cfg),
 		config:        DefaultCupsonlineConfig(),
 		isClient:      isClient,
-		flows:         make(map[flowKey]*flowSender),
 		stopCh:        make(chan struct{}),
 		statsStart:    time.Now(),
 	}
@@ -684,7 +687,6 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 	utils.Debugf("[CUPS] client mode: %d rooms from base64", len(t.urls))
 	return t
 }
-
 
 func (t *CupsonlineTransport) Start() error {
 	if t.clientErr != nil {
@@ -758,35 +760,37 @@ func (t *CupsonlineTransport) Stop() error {
 	return t.BaseTransport.Stop()
 }
 
-// Send — flow-hash: один TCP-flow всегда в один WS-канал.
-// Это гарантирует порядок внутри потока, Centrifugo сохраняет порядок push'ей.
+// Send spreads batches over every room. The per-flow hashing this replaced
+// could never work here: it parses an IPv4 header, but a codec sits above the
+// transport and what arrives is a batch whose first byte is its format version,
+// so the key was always zero and all four rooms' traffic went down one of them.
+// Three quarters of the channel sat idle.
+//
+// Round-robin rather than a repaired flow key, because by this layer there is
+// no flow left to honour — the codec has already mixed packets from every
+// connection into one batch. Reordering is safe all the way down: the
+// encryption layer checks a random nonce against a set rather than a counter,
+// batches carry no sequence and decode independently, and what rides inside is
+// TCP, which reorders for a living.
 func (t *CupsonlineTransport) Send(data []byte) error {
-	if len(t.wss) == 0 {
+	n := len(t.wss)
+	if n == 0 {
 		return fmt.Errorf("no ws")
 	}
-	key := extractFlowKey(data)
-
-	t.flowMu.RLock()
-	fs, ok := t.flows[key]
-	t.flowMu.RUnlock()
-
-	if !ok {
-		t.flowMu.Lock()
-		fs, ok = t.flows[key]
-		if !ok {
-			idx := int(flowHash(key) % uint64(len(t.wss)))
-			fs = &flowSender{chIdx: idx}
-			t.flows[key] = fs
-			t.wss[idx].stats.flows.Add(1)
-			utils.Debugf("[CUPS] new flow %s:%d -> %s:%d proto=%d -> ws[%d] %s",
-				ipStr(key.srcIP), key.srcPort, ipStr(key.dstIP), key.dstPort, key.proto,
-				idx, t.wss[idx].auth.roomUUID[:8])
-		}
-		t.flowMu.Unlock()
+	// One room unless asked otherwise — see cupsSpread for the measurement.
+	if !cupsSpread {
+		n = 1
 	}
-
-	fs.seq.Add(1)
-	return t.wss[fs.chIdx].Send(data)
+	start := int(t.nextWS.Add(1))
+	for i := 0; i < n; i++ {
+		ws := t.wss[(start+i)%n]
+		if ws.connected.Load() {
+			return ws.Send(data)
+		}
+	}
+	// Nothing is up: queue on one anyway rather than dropping, so a brief
+	// reconnect costs latency instead of data.
+	return t.wss[start%n].Send(data)
 }
 
 func (t *CupsonlineTransport) handleIncoming(pkt []byte) {
@@ -860,13 +864,12 @@ func (t *CupsonlineTransport) statsLoop() {
 				totalBytesSent += bs
 				totalBytesRecv += br
 
-				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  reconn=%d  conn=%v",
+				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  reconn=%d  conn=%v",
 					i, ws.auth.roomUUID[:8],
 					dS/uint64(t.config.StatsInterval.Seconds()),
 					float64(dBS)/t.config.StatsInterval.Seconds()/1024,
 					dR/uint64(t.config.StatsInterval.Seconds()),
 					float64(dBR)/t.config.StatsInterval.Seconds()/1024,
-					ws.stats.flows.Load(),
 					ws.stats.reconnects.Load(),
 					ws.connected.Load(),
 				)
@@ -880,12 +883,12 @@ func (t *CupsonlineTransport) statsLoop() {
 			lastTotalBytesSent = totalBytesSent
 			lastTotalBytesRecv = totalBytesRecv
 
-			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  uptime=%v",
+			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  каналов=%d  uptime=%v",
 				dtS/uint64(t.config.StatsInterval.Seconds()),
 				float64(dtBS)/t.config.StatsInterval.Seconds()/1024,
 				dtR/uint64(t.config.StatsInterval.Seconds()),
 				float64(dtBR)/t.config.StatsInterval.Seconds()/1024,
-				len(t.flows),
+				len(t.wss),
 				time.Since(t.statsStart).Round(time.Second),
 			)
 		}
@@ -901,42 +904,6 @@ func (t *CupsonlineTransport) RoomUUIDs() []string {
 }
 
 // ---- helpers ----
-
-func extractFlowKey(pkt []byte) flowKey {
-	if len(pkt) < 20 {
-		return flowKey{}
-	}
-	if pkt[0]>>4 != 4 {
-		return flowKey{}
-	}
-	proto := pkt[9]
-	srcIP := binary.BigEndian.Uint32(pkt[12:16])
-	dstIP := binary.BigEndian.Uint32(pkt[16:20])
-	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+4 {
-		return flowKey{srcIP: srcIP, dstIP: dstIP, proto: proto}
-	}
-	if proto == 6 || proto == 17 {
-		sp := binary.BigEndian.Uint16(pkt[ihl : ihl+2])
-		dp := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
-		return flowKey{srcIP: srcIP, dstIP: dstIP, srcPort: sp, dstPort: dp, proto: proto}
-	}
-	return flowKey{srcIP: srcIP, dstIP: dstIP, proto: proto}
-}
-
-// flowHash — детерминированный хеш от flow. Один поток всегда на один WS.
-func flowHash(k flowKey) uint64 {
-	h := fnv.New64a()
-	var b [14]byte
-	binary.BigEndian.PutUint32(b[0:4], k.srcIP)
-	binary.BigEndian.PutUint32(b[4:8], k.dstIP)
-	binary.BigEndian.PutUint16(b[8:10], k.srcPort)
-	binary.BigEndian.PutUint16(b[10:12], k.dstPort)
-	b[12] = k.proto
-	b[13] = 0
-	h.Write(b[:])
-	return h.Sum64()
-}
 
 func ipStr(ip uint32) string {
 	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
