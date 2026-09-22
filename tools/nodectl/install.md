@@ -34,7 +34,7 @@ sudo install -d -m 755 /etc/openflux
 sudo tee /etc/openflux/flags >/dev/null <<'EOF'
 OPENFLUX_FLAGS=--role=exit --mode=l4 --transport=mailru --url-file=/etc/openflux/url.txt --encryption-key-file=/etc/openflux/secret.txt
 EOF
-sudo chown kuzmich /etc/openflux/flags /etc/openflux/url.txt
+sudo chown <пользователь> /etc/openflux/flags /etc/openflux/url.txt
 sudo chmod 644 /etc/openflux/flags /etc/openflux/url.txt
 ```
 
@@ -61,7 +61,7 @@ ExecStart=/bin/sh -c 'exec /usr/local/bin/openflux $OPENFLUX_FLAGS'
 
 ```
 sudo tee /etc/sudoers.d/nodectl >/dev/null <<'EOF'
-kuzmich ALL=(root) NOPASSWD: /usr/bin/systemctl start openflux, /usr/bin/systemctl stop openflux, /usr/bin/systemctl restart openflux, /usr/bin/install -m755 -o root -g root /var/lib/nodectl/openflux.new /usr/local/bin/openflux
+<пользователь> ALL=(root) NOPASSWD: /usr/bin/systemctl start openflux, /usr/bin/systemctl stop openflux, /usr/bin/systemctl restart openflux, /usr/bin/install -m755 -o root -g root /var/lib/nodectl/openflux.new /usr/local/bin/openflux
 EOF
 sudo chmod 440 /etc/sudoers.d/nodectl
 sudo visudo -c
@@ -73,7 +73,7 @@ sudo visudo -c
 **4. Сама панель.**
 
 ```
-sudo install -d -m 755 -o kuzmich /var/lib/nodectl
+sudo install -d -m 755 -o <пользователь> /var/lib/nodectl
 sudo install -m 755 /tmp/nodectl /usr/local/bin/nodectl
 
 sudo tee /etc/systemd/system/nodectl.service >/dev/null <<'EOF'
@@ -82,8 +82,8 @@ Description=Панель управления нодой OpenFlux
 After=network-online.target
 
 [Service]
-User=kuzmich
-Environment=NODECTL_ADDR=192.168.1.35:8787
+User=<пользователь>
+Environment=NODECTL_ADDR=<адрес-ноды-в-вашей-сети>:8787
 Environment=NODECTL_TOKEN=ЗАМЕНИТЬ_НА_ДЛИННУЮ_СЛУЧАЙНУЮ_СТРОКУ
 ExecStart=/usr/local/bin/nodectl
 Restart=always
@@ -104,7 +104,7 @@ sudo systemctl enable --now nodectl
 **5. Открыть.**
 
 ```
-http://192.168.1.35:8787/?t=<токен>
+http://<адрес-ноды>:8787/?t=<токен>
 ```
 
 ## Полный откат

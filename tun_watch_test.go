@@ -32,12 +32,12 @@ func TestWatcherSkipsProtectedAddresses(t *testing.T) {
 	// consult the predicate. Verified through the predicate itself: installing
 	// a route would shell out to `route`, which a unit test must not do.
 	w := NewSocketWatcher("192.168.1.1", nil)
-	w.SetProtected(func(ip string) bool { return ip == "192.168.1.35" })
+	w.SetProtected(func(ip string) bool { return ip == "192.0.2.53" })
 
 	if w.isProtected == nil {
 		t.Fatal("the predicate was not installed")
 	}
-	if !w.isProtected("192.168.1.35") {
+	if !w.isProtected("192.0.2.53") {
 		t.Error("the resolver must be reported as protected")
 	}
 	if w.isProtected("95.163.48.30") {

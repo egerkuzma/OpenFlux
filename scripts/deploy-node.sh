@@ -11,7 +11,18 @@
 # В репозитории его нет и быть не должно.
 set -euo pipefail
 
-PANEL="${NODECTL_PANEL:-http://192.168.1.35:8787}"
+# Адрес панели и токен берутся из ~/.config/openflux/, а не из репозитория:
+# и то и другое описывает одну конкретную установку и в общий код не годится.
+PANEL_FILE="${NODECTL_PANEL_FILE:-$HOME/.config/openflux/nodectl-panel}"
+PANEL="${NODECTL_PANEL:-}"
+if [ -z "$PANEL" ] && [ -f "$PANEL_FILE" ]; then
+    PANEL=$(tr -d '[:space:]' < "$PANEL_FILE")
+fi
+if [ -z "$PANEL" ]; then
+    echo "нет адреса панели: положите его в $PANEL_FILE" >&2
+    echo "  например: echo http://10.0.0.5:8787 > $PANEL_FILE" >&2
+    exit 1
+fi
 TOKEN_FILE="${NODECTL_TOKEN_FILE:-$HOME/.config/openflux/nodectl-token}"
 OUT="${TMPDIR:-/tmp}/openflux-linux"
 

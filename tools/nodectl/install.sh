@@ -9,8 +9,8 @@
 set -euo pipefail
 
 TOKEN="${1:-}"
-PANEL_USER="${2:-kuzmich}"
-ADDR="${3:-192.168.1.35:8787}"
+PANEL_USER="${2:-$(id -un)}"
+ADDR="${3:-127.0.0.1:8787}"
 BIN_SRC="${4:-/tmp/nodectl}"
 
 [ "$(id -u)" -eq 0 ] || { echo "нужен root: sudo bash $0 <токен>" >&2; exit 1; }

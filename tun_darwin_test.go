@@ -91,7 +91,7 @@ func TestParseIfconfigIPv4(t *testing.T) {
 func TestProtectedAddresses(t *testing.T) {
 	c := &TUNClient{}
 
-	if c.IsProtected("192.168.1.35") {
+	if c.IsProtected("192.0.2.53") {
 		t.Error("nothing is protected before anything is registered")
 	}
 
@@ -99,8 +99,8 @@ func TestProtectedAddresses(t *testing.T) {
 	// watcher consults this before installing a bypass route, and pinning a
 	// resolver that lives behind the exit node to the physical gateway would
 	// make it unreachable.
-	c.protectIP("192.168.1.35")
-	if !c.IsProtected("192.168.1.35") {
+	c.protectIP("192.0.2.53")
+	if !c.IsProtected("192.0.2.53") {
 		t.Error("the registered address must be protected")
 	}
 	if c.IsProtected("8.8.8.8") {

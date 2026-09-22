@@ -38,7 +38,7 @@ func TestIsDNSQuery(t *testing.T) {
 	query := []byte{0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
 
 	t.Run("udp port 53 is a query", func(t *testing.T) {
-		ihl, ok := isDNSQuery(udpPacket("10.10.10.2", "192.168.1.35", 5300, 53, query))
+		ihl, ok := isDNSQuery(udpPacket("10.10.10.2", "192.0.2.53", 5300, 53, query))
 		if !ok {
 			t.Fatal("expected a DNS query")
 		}
@@ -54,7 +54,7 @@ func TestIsDNSQuery(t *testing.T) {
 	})
 
 	t.Run("tcp is not", func(t *testing.T) {
-		p := udpPacket("10.10.10.2", "192.168.1.35", 5300, 53, query)
+		p := udpPacket("10.10.10.2", "192.0.2.53", 5300, 53, query)
 		p[9] = 6 // TCP
 		if _, ok := isDNSQuery(p); ok {
 			t.Fatal("TCP must be forwarded, not intercepted")
@@ -66,7 +66,7 @@ func TestIsDNSQuery(t *testing.T) {
 			"empty":        {},
 			"stub":         {0x45, 0, 0, 20},
 			"ipv6":         append([]byte{0x60}, make([]byte, 40)...),
-			"truncated":    udpPacket("10.10.10.2", "192.168.1.35", 5300, 53, query)[:22],
+			"truncated":    udpPacket("10.10.10.2", "192.0.2.53", 5300, 53, query)[:22],
 			"bogus header": {0x40, 0, 0, 40, 0, 0, 0, 0, 64, 17, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 53, 0, 53, 0, 8, 0, 0},
 		}
 		for name, pkt := range cases {
@@ -80,7 +80,7 @@ func TestIsDNSQuery(t *testing.T) {
 func TestBuildDNSResponse(t *testing.T) {
 	const (
 		client   = "10.10.10.2"
-		resolver = "192.168.1.35"
+		resolver = "192.0.2.53"
 		srcPort  = uint16(51234)
 	)
 	answer := []byte{0xAB, 0xCD, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 0xde, 0xad}

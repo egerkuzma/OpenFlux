@@ -482,7 +482,7 @@ type page struct {
 func main() {
 	addr := os.Getenv("NODECTL_ADDR")
 	if addr == "" {
-		addr = "192.168.1.35:8787"
+		addr = "127.0.0.1:8787"
 	}
 	token := os.Getenv("NODECTL_TOKEN")
 	if len(token) < 16 {
