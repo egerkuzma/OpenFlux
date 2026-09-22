@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -33,6 +34,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -169,22 +171,26 @@ func currentSettings() settings {
 	return s
 }
 
+// The field names double as the keys the page reads, so a state update is one
+// JSON object and no template.
 type health struct {
-	StagedSize string
-	StagedTime string
-	StagedSum  string
-	BinarySum  string
-	SameBuild  bool
-	Rooms      string
-	Active     string
-	Since      string
-	Links      string
-	Joins      string
-	Closures   string
-	Watchdog   string
-	Batches    string
-	BinarySize string
-	BinaryTime string
+	Log        string `json:"log"`
+	StagedSize string `json:"stagedSize"`
+	StagedTime string `json:"stagedTime"`
+	StagedSum  string `json:"stagedSum"`
+	BinarySum  string `json:"binarySum"`
+	SameBuild  bool   `json:"sameBuild"`
+	Rooms      string `json:"rooms"`
+	Active     string `json:"active"`
+	Since      string `json:"since"`
+	Links      string `json:"links"`
+	Joins      string `json:"joins"`
+	Closures   string `json:"closures"`
+	Watchdog   string `json:"watchdog"`
+	Batches    string `json:"batches"`
+	BinarySize string `json:"binarySize"`
+	BinaryTime string `json:"binaryTime"`
+	Scanned    string `json:"scanned"`
 }
 
 var (
@@ -195,22 +201,34 @@ var (
 
 // readHealth turns the last twenty minutes of journal into the handful of
 // numbers every investigation so far has ended up grepping for.
-func readHealth() health {
-	h := health{Active: "неизвестно"}
-	if out, err := run("systemctl", "is-active", unitName); err == nil || out != "" {
-		h.Active = out
-	}
-	if out, err := run("systemctl", "show", unitName, "-p", "ActiveEnterTimestamp", "--value"); err == nil {
-		h.Since = out
-	}
-	if fi, err := os.Stat(binaryPath); err == nil {
-		h.BinarySize = fmt.Sprintf("%.1f МБ", float64(fi.Size())/1e6)
-		h.BinaryTime = fi.ModTime().Format("2006-01-02 15:04")
-	}
+// scanInterval is how often the journal is read. Reading it is what made this
+// panel slow: twenty minutes of a node running with --debug is forty thousand
+// lines, journalctl needs four and a half seconds to hand them over, and the
+// old code paid that on every request — for six counters that only move when
+// something goes wrong. A page that takes six seconds to open is one nobody
+// opens while the thing they are watching is still happening.
+const scanInterval = 20 * time.Second
 
+// journalScan is what the last read of the journal found. Twenty-second-old
+// numbers are fine for a health page. What must be exact — whether the unit is
+// up, which build is installed — is still read on every request, because those
+// are what a person changes and then immediately looks at.
+type journalScan struct {
+	links, joins, closures, watchdog, batches, rooms string
+	taken                                            time.Time
+}
+
+var lastScan struct {
+	sync.Mutex
+	v journalScan
+}
+
+// scanJournal does the expensive reading, away from any request.
+func scanJournal() journalScan {
+	sc := journalScan{taken: time.Now()}
 	out, _ := run("journalctl", "-u", unitName, "--since", "20 min ago", "--no-pager")
 	var answered, unanswered, closures, watchdog, batches int
-	links := "—"
+	sc.links = "—"
 	for _, l := range strings.Split(out, "\n") {
 		switch {
 		case reAnswered.MatchString(l):
@@ -225,18 +243,56 @@ func readHealth() health {
 			batches++
 		}
 		if m := reLinks.FindStringSubmatch(l); m != nil {
-			links = m[1]
+			sc.links = m[1]
 		}
 	}
-	h.Links = links
 	if total := answered + unanswered; total > 0 {
-		h.Joins = fmt.Sprintf("%d из %d без ответа (%d%%)", unanswered, total, unanswered*100/total)
+		sc.joins = fmt.Sprintf("%d из %d без ответа (%d%%)", unanswered, total, unanswered*100/total)
 	} else {
-		h.Joins = "нет данных"
+		sc.joins = "нет данных"
 	}
-	h.Closures = strconv.Itoa(closures)
-	h.Watchdog = strconv.Itoa(watchdog)
-	h.Batches = strconv.Itoa(batches)
+	sc.closures = strconv.Itoa(closures)
+	sc.watchdog = strconv.Itoa(watchdog)
+	sc.batches = strconv.Itoa(batches)
+	sc.rooms = clientRooms()
+	return sc
+}
+
+// keepScanning refreshes those numbers for as long as the panel runs.
+func keepScanning() {
+	for {
+		sc := scanJournal()
+		lastScan.Lock()
+		lastScan.v = sc
+		lastScan.Unlock()
+		time.Sleep(scanInterval)
+	}
+}
+
+func readHealth() health {
+	h := health{Active: "неизвестно"}
+	if out, err := run("systemctl", "is-active", unitName); err == nil || out != "" {
+		h.Active = out
+	}
+	if out, err := run("systemctl", "show", unitName, "-p", "ActiveEnterTimestamp", "--value"); err == nil {
+		h.Since = out
+	}
+	if fi, err := os.Stat(binaryPath); err == nil {
+		h.BinarySize = fmt.Sprintf("%.1f МБ", float64(fi.Size())/1e6)
+		h.BinaryTime = fi.ModTime().Format("2006-01-02 15:04")
+	}
+
+	lastScan.Lock()
+	sc := lastScan.v
+	lastScan.Unlock()
+	h.Links, h.Joins = sc.links, sc.joins
+	h.Closures, h.Watchdog, h.Batches = sc.closures, sc.watchdog, sc.batches
+	h.Rooms = sc.rooms
+	if sc.taken.IsZero() {
+		h.Scanned = "журнал ещё не прочитан"
+	} else {
+		h.Scanned = fmt.Sprintf("%d с назад", int(time.Since(sc.taken).Seconds()))
+	}
 	if fi, err := os.Stat(stagedPath); err == nil {
 		h.StagedSize = fmt.Sprintf("%.1f МБ", float64(fi.Size())/1e6)
 		h.StagedTime = fi.ModTime().Format("2006-01-02 15:04")
@@ -244,7 +300,6 @@ func readHealth() health {
 	}
 	h.BinarySum = sumOf(binaryPath)
 	h.SameBuild = h.StagedSum != "" && h.StagedSum == h.BinarySum
-	h.Rooms = clientRooms()
 	return h
 }
 
@@ -291,7 +346,27 @@ func extractRooms(journal string) string {
 // sent, even when they are the same build — and after an install the panel
 // went on offering a build that was already in place. A hash says plainly
 // whether the two are the same thing.
+var sums struct {
+	sync.Mutex
+	m map[string]string
+}
+
 func sumOf(path string) string {
+	// Hashing two 19 MB builds on every request buys nothing: a file that has
+	// not changed cannot have a different hash, and size plus modification
+	// time is enough to say so. Installing rewrites the file, which moves both.
+	fi, statErr := os.Stat(path)
+	var key string
+	if statErr == nil {
+		key = fmt.Sprintf("%s|%d|%d", path, fi.Size(), fi.ModTime().UnixNano())
+		sums.Lock()
+		cached, ok := sums.m[key]
+		sums.Unlock()
+		if ok {
+			return cached
+		}
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return ""
@@ -301,7 +376,16 @@ func sumOf(path string) string {
 	if _, err := io.Copy(h, f); err != nil {
 		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	sum := hex.EncodeToString(h.Sum(nil))[:12]
+	if key != "" {
+		sums.Lock()
+		if sums.m == nil {
+			sums.m = map[string]string{}
+		}
+		sums.m[key] = sum
+		sums.Unlock()
+	}
+	return sum
 }
 
 func tailLog(n int) string {
@@ -408,6 +492,11 @@ func main() {
 		log.Fatalf("каталог для заливки: %v", err)
 	}
 
+	// The first scan runs before the first page is served, so the panel never
+	// opens with empty counters and no explanation for them.
+	lastScan.v = scanJournal()
+	go keepScanning()
+
 	tpl := template.Must(template.New("page").Parse(pageHTML))
 
 	authed := func(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
@@ -417,7 +506,20 @@ func main() {
 				got = r.Header.Get("X-Token")
 			}
 			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-				http.Error(w, "нет доступа", http.StatusForbidden)
+				// Say which of the two it is. Bare "нет доступа" sent someone
+				// hunting for a broken panel when the address had simply lost
+				// its token — and it used to hide itself, because every action
+				// redirected and put the token back in the bar. Nothing
+				// navigates now, so an address without it stays that way.
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				if got == "" {
+					io.WriteString(w, "В адресе нет токена.\n\n"+
+						"Панель открывается так:  http://"+r.Host+"/?t=<токен>\n"+
+						"Токен лежит в /etc/systemd/system/nodectl.service на ноде.\n")
+					return
+				}
+				io.WriteString(w, "Токен не подходит.\n")
 				return
 			}
 			h(w, r)
@@ -439,6 +541,17 @@ func main() {
 		show(w, r, r.URL.Query().Get("ok"), r.URL.Query().Get("err"))
 	}))
 
+	// The page asks for this every few seconds and redraws itself from it.
+	// Nothing here navigates: an action that restarts the node would otherwise
+	// send the browser to a page it cannot reach, because when the tunnel is up
+	// the route to this panel runs through the node being restarted.
+	http.HandleFunc("/state", authed(func(w http.ResponseWriter, r *http.Request) {
+		h := readHealth()
+		h.Log = tailLog(120)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(h)
+	}))
+
 	http.HandleFunc("/apply", authed(func(w http.ResponseWriter, r *http.Request) {
 		s := settings{
 			Transport: r.FormValue("transport"),
@@ -453,14 +566,14 @@ func main() {
 			return
 		}
 		afterReply(func() { unitAction("restart") })
-		reply(w, r, token, "параметры записаны, перезапускаю — страница вернётся через полминуты", "")
+		reply(w, r, token, "параметры записаны, нода перезапускается", "")
 	}))
 
 	http.HandleFunc("/unit", authed(func(w http.ResponseWriter, r *http.Request) {
 		switch r.FormValue("action") {
 		case "restart":
 			afterReply(func() { unitAction("restart") })
-			reply(w, r, token, "перезапускаю — страница вернётся через полминуты", "")
+			reply(w, r, token, "нода перезапускается", "")
 		case "start":
 			// Starting cannot cut us off, so there is no reason to defer it.
 			if out, err := unitAction("start"); err != nil {
@@ -480,7 +593,7 @@ func main() {
 				return
 			}
 			afterReply(func() { unitAction("restart") })
-			reply(w, r, token, "сборка установлена, перезапускаю — страница вернётся через полминуты", "")
+			reply(w, r, token, "сборка установлена, нода перезапускается", "")
 		default:
 			reply(w, r, token, "", "неизвестное действие")
 		}
@@ -556,11 +669,15 @@ func reply(w http.ResponseWriter, r *http.Request, token, ok, problem string) {
 	fmt.Fprintln(w, ok)
 }
 
+// redirect sends the browser back to the panel.
+//
+// Only a problem travels in the address: the page itself shows what happened —
+// which build is running, whether the unit is up, what the journal says — so a
+// banner repeating "done" adds a line to read and nothing to learn. A failure
+// is the opposite: without it the page looks exactly as it did before, and the
+// reason would be gone.
 func redirect(w http.ResponseWriter, r *http.Request, token, ok, problem string) {
 	v := url.Values{"t": {token}}
-	if ok != "" {
-		v.Set("ok", ok)
-	}
 	if problem != "" {
 		v.Set("err", problem)
 	}

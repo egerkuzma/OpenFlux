@@ -40,22 +40,23 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:var(--b
 <h1>Нода OpenFlux</h1>
 <p class="sub">Выходной узел: параметры, состояние и журнал.</p>
 
-{{if .Notice}}<div class="note">{{.Notice}}</div>{{end}}
-{{if .Problem}}<div class="note bad">{{.Problem}}</div>{{end}}
+<div class="note bad" id="problem" {{if not .Problem}}hidden{{end}}>{{.Problem}}</div>
 
 <h2>Состояние</h2>
 <div class="grid">
-  <div class="cell"><div class="k">служба</div><div class="v">{{.Health.Active}}</div></div>
-  <div class="cell"><div class="k">каналы</div><div class="v">{{.Health.Links}}</div></div>
-  <div class="cell"><div class="k">входы без ответа</div><div class="v">{{.Health.Joins}}</div></div>
-  <div class="cell"><div class="k">обрывов за 20 мин</div><div class="v">{{.Health.Closures}}</div></div>
-  <div class="cell"><div class="k">сторож сработал</div><div class="v">{{.Health.Watchdog}}</div></div>
-  <div class="cell"><div class="k">потерянных пачек</div><div class="v">{{.Health.Batches}}</div></div>
+  <div class="cell"><div class="k">служба</div><div class="v" id="active">{{.Health.Active}}</div></div>
+  <div class="cell"><div class="k">каналы</div><div class="v" id="links">{{.Health.Links}}</div></div>
+  <div class="cell"><div class="k">входы без ответа</div><div class="v" id="joins">{{.Health.Joins}}</div></div>
+  <div class="cell"><div class="k">обрывов за 20 мин</div><div class="v" id="closures">{{.Health.Closures}}</div></div>
+  <div class="cell"><div class="k">сторож сработал</div><div class="v" id="watchdog">{{.Health.Watchdog}}</div></div>
+  <div class="cell"><div class="k">потерянных пачек</div><div class="v" id="batches">{{.Health.Batches}}</div></div>
 </div>
-<p class="hint">запущена: {{.Health.Since}} · сборка <code>{{.Health.BinarySum}}</code>,
+<p class="hint" id="scanned">числа выше — из журнала, {{.Health.Scanned}}</p>
+<p class="hint" id="binline">запущена: {{.Health.Since}} · сборка <code>{{.Health.BinarySum}}</code>,
   {{.Health.BinarySize}}{{if .Health.SameBuild}} · присланная сборка — та же самая{{end}}</p>
+<p class="hint" id="pulse" hidden></p>
 
-<form method="post" action="/unit?t={{.Token}}">
+<form method="post" action="/unit?t={{.Token}}" onsubmit="send(event); return false">
   <div class="bar">
     <button name="action" value="restart">Перезапустить</button>
     <button name="action" value="start">Запустить</button>
@@ -67,21 +68,21 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:var(--b
     придётся вторым путём до машины.</p>
 </form>
 
-{{if and .Health.StagedSize (not .Health.SameBuild)}}
+<div id="stagedblock" {{if or (not .Health.StagedSize) .Health.SameBuild}}hidden{{end}}>
 <h2>Ждёт установки</h2>
 <div class="card">
-  <p style="margin:0 0 4px">Присланная сборка <code>{{.Health.StagedSum}}</code>,
+  <p style="margin:0 0 4px" id="stagedline">Присланная сборка <code>{{.Health.StagedSum}}</code>,
     {{.Health.StagedSize}}, {{.Health.StagedTime}}.</p>
-  <p class="hint" style="margin-top:0">Работает <code>{{.Health.BinarySum}}</code> — это другая сборка.
+  <p class="hint" style="margin-top:0">Работает другая сборка.
     Установка перезапустит ноду, а вместе с ней и туннель: страница вернётся через полминуты.</p>
-  <form method="post" action="/unit?t={{.Token}}">
+  <form method="post" action="/unit?t={{.Token}}" onsubmit="send(event); return false">
     <div class="bar"><button class="go" name="action" value="install">Установить и перезапустить</button></div>
   </form>
 </div>
-{{end}}
+</div>
 
 <h2>Параметры</h2>
-<form method="post" action="/apply?t={{.Token}}" class="card">
+<form method="post" action="/apply?t={{.Token}}" class="card" onsubmit="send(event); return false">
   <div class="row">
     <label><div class="lab">Транспорт</div>
       <select name="transport" id="transport" onchange="showDocs()">
@@ -119,19 +120,107 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:var(--b
   <div class="bar"><button class="go" type="submit">Применить и перезапустить</button></div>
 </form>
 
-{{if .Health.Rooms}}
+<div id="roomsblock" {{if not .Health.Rooms}}hidden{{end}}>
 <h2>Комнаты для клиента</h2>
 <div class="card">
   <p class="hint" style="margin-top:0">Нода создала комнаты сама. Эту строку нужно вставить в поле ссылок
     у клиента — без неё ему не к чему подключаться. При каждом перезапуске она новая.</p>
-  <textarea readonly onclick="this.select()" style="min-height:64px">{{.Health.Rooms}}</textarea>
+  <textarea readonly onclick="this.select()" style="min-height:64px" id="rooms">{{.Health.Rooms}}</textarea>
 </div>
-{{end}}
+</div>
 
 <h2>Журнал, последние 120 строк</h2>
-<pre>{{.Log}}</pre>
+<pre id="log">{{.Log}}</pre>
 
 <script>
+var TOKEN = "{{.Token}}";
+
+// The page keeps itself current instead of navigating.
+//
+// Every action here can take the node down, and when the tunnel is up the
+// route to this panel runs through the node being restarted — a redirect would
+// send the browser somewhere it cannot reach, and browsers do not retry a
+// failed navigation. So nothing navigates: actions are posted in place, and
+// the state is fetched on a timer. While the node is away the fetch simply
+// fails, the page says so, and it recovers by itself when the node answers
+// again.
+var missedSince = 0;
+
+function draw(s) {
+  missedSince = 0;
+  document.getElementById('pulse').hidden = true;
+  var set = function (id, v) {
+    var el = document.getElementById(id);
+    if (el && el.textContent !== v) { el.textContent = v; }
+  };
+  set('active', s.active);
+  set('links', s.links);
+  set('joins', s.joins);
+  set('closures', s.closures);
+  set('watchdog', s.watchdog);
+  set('batches', s.batches);
+  set('scanned', 'числа выше — из журнала, ' + s.scanned);
+  set('log', s.log);
+  document.getElementById('binline').textContent =
+    'запущена: ' + s.since + ' · сборка ' + s.binarySum + ', ' + s.binarySize +
+    (s.sameBuild ? ' · присланная сборка — та же самая' : '');
+
+  var staged = s.stagedSize && !s.sameBuild;
+  document.getElementById('stagedblock').hidden = !staged;
+  if (staged) {
+    document.getElementById('stagedline').textContent =
+      'Присланная сборка ' + s.stagedSum + ', ' + s.stagedSize + ', ' + s.stagedTime + '.';
+  }
+  document.getElementById('roomsblock').hidden = !s.rooms;
+  if (s.rooms) { document.getElementById('rooms').value = s.rooms; }
+}
+
+function poll() {
+  fetch('/state?t=' + encodeURIComponent(TOKEN), {cache: 'no-store'})
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+    .then(draw)
+    .catch(function () {
+      // Expected while the node is restarting: the way back leads through it.
+      missedSince++;
+      var p = document.getElementById('pulse');
+      p.hidden = false;
+      p.textContent = 'нода не отвечает (' + missedSince * 3 + ' с) — жду, страница обновится сама';
+    });
+}
+setInterval(poll, 3000);
+
+// Forms post in place. The answer is only read for a refusal: everything that
+// went right is already visible in the state that follows.
+//
+// Two things here are not the obvious ones.
+//
+// The address comes from getAttribute, not from form.action, because a control
+// named "action" shadows the form's own property — and every button here is
+// named "action". form.action returned the button, the button stringified into
+// nonsense, and the request went out with no token at all and was refused.
+//
+// And the pressed button has to be added by hand: FormData built from a form
+// leaves out the submitter, so "which action" never travelled with the request
+// that was supposed to carry it.
+function send(ev) {
+  ev.preventDefault();
+  var form = ev.target;
+  var data = new FormData(form);
+  var pressed = ev.submitter;
+  if (pressed && pressed.name) { data.append(pressed.name, pressed.value); }
+  data.append('fmt', 'text');
+  fetch(form.getAttribute('action') + '&fmt=text', {method: 'POST', body: data})
+    .then(function (r) { return r.text().then(function (t) { return {ok: r.ok, t: t}; }); })
+    .then(function (res) {
+      var box = document.getElementById('problem');
+      box.hidden = res.ok;
+      if (!res.ok) { box.textContent = res.t; }
+      setTimeout(poll, 500);
+    })
+    .catch(function () { setTimeout(poll, 500); });
+  return false;
+}
+
 // The documents box belongs to the transports that are driven by documents.
 // Switching the picker changes which of the two notes applies, so the page
 // does not ask for a list that the chosen transport will never read.
