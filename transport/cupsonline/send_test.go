@@ -2,6 +2,7 @@ package cupsonline
 
 import (
 	"testing"
+	"time"
 )
 
 // testChannels builds n rooms that accept sends without a network, and returns
@@ -142,5 +143,39 @@ func TestStartingTwiceDoesNotDoubleTheChannels(t *testing.T) {
 	}
 	if got := len(tr.wss); got != 4 {
 		t.Errorf("каналов стало %d вместо 4 — комплект задвоился", got)
+	}
+}
+
+// A full queue must refuse at once, not wait. Waiting is what let 65536 slots
+// become eight minutes of buffered traffic, which the TCP streams inside the
+// tunnel read as a round trip of minutes and answered with a retransmission
+// storm. The refusal is the congestion signal.
+func TestAFullQueueRefusesInsteadOfWaiting(t *testing.T) {
+	tr, queues := testChannels(1)
+	// Заполняем очередь единственной комнаты до края.
+	for len(queues[0]) < cap(queues[0]) {
+		queues[0] <- []byte{0x02}
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- tr.Send([]byte{0x02, 0x01}) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("переполненная очередь приняла пакет")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send заблокировался на полной очереди — сигнала о перегрузке не будет")
+	}
+}
+
+// The queue is sized to signal early, not to hoard. At the speed this channel
+// actually runs, the old depth was minutes of traffic.
+func TestTheSendQueueIsNotABuffer(t *testing.T) {
+	cfg := DefaultCupsonlineConfig()
+	if cfg.SendQueueSize > 4096 {
+		t.Errorf("очередь %d пачек — при 8 КБ на пачку это %d МБ буфера",
+			cfg.SendQueueSize, cfg.SendQueueSize*8/1024)
 	}
 }

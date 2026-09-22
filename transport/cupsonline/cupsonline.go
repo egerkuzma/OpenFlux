@@ -75,7 +75,9 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		BatchMaxBytes:   32 * 1024,
 		BatchTimeout:    2 * time.Millisecond,
 
-		SendQueueSize: 65536,
+		// 1024, as mailru has always used. See cupsWS.Send: the old 65536 was
+		// eight minutes of buffering at the speed this channel actually runs.
+		SendQueueSize: 1024,
 
 		MaxMessageBytes: 32 << 20,
 
@@ -627,6 +629,20 @@ func (w *cupsWS) handleMessage(raw []byte) {
 	}
 }
 
+// Send refuses rather than waits when the queue is full, the way mailru does,
+// and the difference is not a detail.
+//
+// Waiting means the only signal that the channel is overloaded arrives once the
+// buffer is completely full. With 65536 slots that buffer held, at the measured
+// 8.4 Mbit/s, about 512 MB and some eight minutes of traffic — so the TCP
+// streams inside the tunnel saw their round trip climb from 150ms into minutes,
+// fired their retransmission timers, resent everything, and filled the queue
+// further. Textbook bufferbloat, and it is the shape of the gap between a
+// channel that carries 8.4 Mbit/s and a tunnel on it that delivered 3.2.
+//
+// Refusing early is what a congested router does: the loss is the signal, TCP
+// halves its window and settles. mailru has refused from a 1024-slot queue all
+// along, which is why the same stack behaves on that transport.
 func (w *cupsWS) Send(data []byte) error {
 	if len(data) > w.config.MaxPayloadBytes {
 		return fmt.Errorf("too large: %d", len(data))
@@ -636,6 +652,8 @@ func (w *cupsWS) Send(data []byte) error {
 		return nil
 	case <-w.ctx:
 		return fmt.Errorf("closed")
+	default:
+		return fmt.Errorf("send queue full")
 	}
 }
 
