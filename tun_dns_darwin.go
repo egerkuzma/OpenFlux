@@ -5,12 +5,14 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"openflux/network"
@@ -33,8 +35,28 @@ import (
 // gVisor packet-tunnel path, rather than the iOS/Android clients, which resolve
 // outside the tunnel and therefore cannot see a private zone behind the exit.
 
-// dnsQueryTimeout bounds one upstream DNS-over-TCP exchange.
+// dnsQueryTimeout bounds one upstream DNS-over-TCP exchange once it is
+// connected. A resolver that is slow but answering is still a working
+// resolver, so this stays generous.
 const dnsQueryTimeout = 8 * time.Second
+
+// dnsDialTimeout bounds only the TCP handshake, which is a different failure
+// with a different cure. Measured through the tunnel, a whole healthy exchange
+// with the node's resolver costs ~200ms, so a connect that has not landed in
+// two seconds is not a slow resolver: it is a SYN that was dropped. The tunnel
+// carries no UDP, so every query opens its own connection, and the resolver
+// listens with a backlog of 32 — one burst from a browser overflows it.
+//
+// Until this was split from dnsQueryTimeout, such a dial held a dnsSem slot for
+// the full eight seconds. Thirty-two of them froze resolution outright: of 436
+// queries in one session, 426 failed, and 333 of those were rejected on a full
+// semaphore without ever being tried.
+const dnsDialTimeout = 2 * time.Second
+
+// dnsIdleTimeout closes a shared connection that has gone quiet, so a resolver
+// that drops idle sockets and one that keeps them both end up re-dialled on the
+// next query rather than written into after they are gone.
+const dnsIdleTimeout = 30 * time.Second
 
 // maxDNSPayload is how much DNS fits in one datagram on our utun: the MTU set
 // in SetupInterface, minus the IPv4 and UDP headers. A DNS-over-TCP answer has
@@ -59,9 +81,14 @@ func truncateDNS(answer []byte) []byte {
 	return out
 }
 
-// dnsSem caps concurrent upstream DNS resolutions so a burst of queries cannot
-// spawn an unbounded number of tunnelled TCP connections.
-var dnsSem = make(chan struct{}, 32)
+// dnsSem bounds how many queries may be outstanding at once. It used to be 32
+// because each one opened its own connection through the tunnel, and a burst
+// that spawned more than that buried both the tunnel and the resolver's listen
+// backlog. They now share a single connection, so the limit no longer governs
+// connections at all — only how much may sit in the pending map — and a browser
+// opening a page, which fires bursts of around thirty lookups, no longer has to
+// be turned away to protect anything.
+var dnsSem = make(chan struct{}, 256)
 
 // isDNSQuery reports whether pkt is an IPv4 UDP datagram addressed to port 53,
 // and returns the IP header length for the caller.
@@ -132,10 +159,135 @@ func (c *TUNClient) handleDNSQuery(pkt []byte, ihl int) {
 	}
 }
 
-// dnsOverTCP performs one RFC 7766 length-prefixed DNS exchange with dest.
-// The connection is an ordinary socket: the tunnel's default routes carry it
-// to the exit node, which is exactly how it reaches a resolver behind it.
+// A resolver behind the exit is reached over one connection, not one per
+// query. DNS-over-TCP allows exactly this (RFC 7766): several queries may be in
+// flight on a single connection, and answers are matched back by the message
+// ID. Doing it the other way round is what broke resolution here — 1619 queries
+// in four minutes meant 1619 handshakes through a tunnel that sustains ~40
+// batches a second, 1440 of them never completed, and the resolver's listen
+// backlog of 32 overflowed on every burst. One connection carries the same load
+// with one handshake.
+type dnsPipe struct {
+	dest string
+
+	mu      sync.Mutex
+	conn    net.Conn
+	pending map[uint16]chan []byte
+	nextID  uint16
+}
+
+var (
+	dnsPipesMu sync.Mutex
+	dnsPipes   = map[string]*dnsPipe{}
+)
+
+func pipeFor(dest string) *dnsPipe {
+	dnsPipesMu.Lock()
+	defer dnsPipesMu.Unlock()
+	p := dnsPipes[dest]
+	if p == nil {
+		p = &dnsPipe{dest: dest, pending: map[uint16]chan []byte{}}
+		dnsPipes[dest] = p
+	}
+	return p
+}
+
+// conn returns the live connection, dialling once if needed. The caller never
+// sees a half-open one: a failed dial leaves the pipe empty for the next try.
+func (p *dnsPipe) connect() (net.Conn, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn != nil {
+		return p.conn, nil
+	}
+	c, err := net.DialTimeout("tcp", p.dest, dnsDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	p.conn = c
+	go p.read(c)
+	return c, nil
+}
+
+// drop closes the connection and fails everything still waiting on it, so no
+// query is left hanging until its own deadline when the answer can no longer
+// arrive.
+func (p *dnsPipe) drop(c net.Conn) {
+	p.mu.Lock()
+	if c != nil && p.conn != c {
+		p.mu.Unlock() // already replaced; nothing of ours to tear down
+		return
+	}
+	if p.conn != nil {
+		p.conn.Close()
+		p.conn = nil
+	}
+	waiting := p.pending
+	p.pending = map[uint16]chan []byte{}
+	p.mu.Unlock()
+	for _, ch := range waiting {
+		close(ch)
+	}
+}
+
+// read delivers answers to whoever is waiting for that ID until the connection
+// ends.
+func (p *dnsPipe) read(c net.Conn) {
+	defer p.drop(c)
+	for {
+		c.SetReadDeadline(time.Now().Add(dnsIdleTimeout))
+		var hdr [2]byte
+		if _, err := io.ReadFull(c, hdr[:]); err != nil {
+			return
+		}
+		answer := make([]byte, binary.BigEndian.Uint16(hdr[:]))
+		if _, err := io.ReadFull(c, answer); err != nil {
+			return
+		}
+		if len(answer) < 2 {
+			continue
+		}
+		id := binary.BigEndian.Uint16(answer[:2])
+
+		p.mu.Lock()
+		ch := p.pending[id]
+		delete(p.pending, id)
+		p.mu.Unlock()
+		if ch != nil {
+			ch <- answer
+		}
+	}
+}
+
+// errResolverHungUp marks the one failure worth retrying: the shared
+// connection went away with the query still on it. Every other error either
+// means the resolver answered badly or that it is unreachable, and repeating
+// those only doubles the load.
+var errResolverHungUp = errors.New("соединение с резолвером оборвалось")
+
+// dnsOverTCP performs one RFC 7766 exchange with dest, retrying once if the
+// shared connection died underneath it. That connection is shared by every
+// lookup, so one reset fails all of them at once — 45 of 605 queries in a
+// single session, every one of them this error and nothing else. A DNS query
+// is idempotent and the pipe re-dials on the next attempt, so the retry costs
+// one round trip and turns a blank page into a loaded one. The browser
+// symptom it removes is having to reload a tab for it to open at all.
 func dnsOverTCP(dest string, query []byte) ([]byte, error) {
+	answer, err := dnsExchange(dest, query)
+	if errors.Is(err, errResolverHungUp) {
+		answer, err = dnsExchange(dest, query)
+	}
+	return answer, err
+}
+
+// dnsExchange performs one RFC 7766 exchange with dest over the shared
+// connection. The query keeps its own ID for the caller, but travels under one
+// we allocate: two applications may legitimately pick the same ID at the same
+// moment, and on a shared connection that would cross their answers.
+func dnsExchange(dest string, query []byte) ([]byte, error) {
+	if len(query) < 2 {
+		return nil, fmt.Errorf("query too short: %d bytes", len(query))
+	}
 	select {
 	case dnsSem <- struct{}{}:
 		defer func() { <-dnsSem }()
@@ -143,29 +295,51 @@ func dnsOverTCP(dest string, query []byte) ([]byte, error) {
 		return nil, fmt.Errorf("too many DNS queries in flight")
 	}
 
-	conn, err := net.DialTimeout("tcp", dest, dnsQueryTimeout)
+	p := pipeFor(dest)
+	conn, err := p.connect()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(dnsQueryTimeout))
 
-	msg := make([]byte, 2+len(query))
-	binary.BigEndian.PutUint16(msg[:2], uint16(len(query)))
-	copy(msg[2:], query)
-	if _, err := conn.Write(msg); err != nil {
-		return nil, err
+	callerID := binary.BigEndian.Uint16(query[:2])
+	wire := make([]byte, 2+len(query))
+	copy(wire[2:], query)
+	binary.BigEndian.PutUint16(wire[:2], uint16(len(query)))
+
+	ch := make(chan []byte, 1)
+	p.mu.Lock()
+	p.nextID++
+	ourID := p.nextID
+	for p.pending[ourID] != nil { // wrapped onto one still in flight
+		p.nextID++
+		ourID = p.nextID
+	}
+	p.pending[ourID] = ch
+	p.mu.Unlock()
+	binary.BigEndian.PutUint16(wire[2:4], ourID)
+
+	p.mu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(dnsQueryTimeout))
+	_, werr := conn.Write(wire)
+	p.mu.Unlock()
+	if werr != nil {
+		p.drop(conn)
+		return nil, werr
 	}
 
-	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		return nil, err
+	select {
+	case answer, ok := <-ch:
+		if !ok {
+			return nil, errResolverHungUp
+		}
+		binary.BigEndian.PutUint16(answer[:2], callerID)
+		return answer, nil
+	case <-time.After(dnsQueryTimeout):
+		p.mu.Lock()
+		delete(p.pending, ourID)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("резолвер не ответил за %v", dnsQueryTimeout)
 	}
-	answer := make([]byte, binary.BigEndian.Uint16(hdr[:]))
-	if _, err := io.ReadFull(conn, answer); err != nil {
-		return nil, err
-	}
-	return answer, nil
 }
 
 // buildDNSResponse wraps a DNS answer in a UDP/IPv4 packet addressed back to
