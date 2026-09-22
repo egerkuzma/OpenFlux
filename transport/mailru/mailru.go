@@ -54,9 +54,45 @@ type MailruDocsInfo struct {
 	EditorUserID string
 }
 
+// wsConn is the part of a websocket connection this transport actually uses.
+// Naming it is what lets reconnect, handover and the watchdog be exercised
+// without a provider on the other end — everything that used to be reachable
+// only by running against the live service and reading the journal afterwards.
+type wsConn interface {
+	ReadMessage() (messageType int, p []byte, err error)
+	WriteMessage(messageType int, data []byte) error
+	SetReadDeadline(t time.Time) error
+	Close() error
+}
+
+// dialWS opens one. Both places that connect — the first attempt and the
+// renewal that replaces a session before the provider cuts it — went through
+// the same dialler with the same timeouts and headers, so there is one of it.
+type dialWS func(wsURL string) (wsConn, *http.Response, error)
+
+func realDialWS(wsURL string) (wsConn, *http.Response, error) {
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		NetDialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	headers := http.Header{}
+	headers.Set("User-Agent", mailruUserAgent)
+	headers.Set("Origin", "https://docs.datacloudmail.ru")
+
+	c, resp, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		// A typed nil in an interface is not nil, and every caller checks.
+		return nil, resp, err
+	}
+	return c, resp, nil
+}
+
 type DocSession struct {
 	Info       MailruDocsInfo
-	Conn       *websocket.Conn
+	Conn       wsConn
 	WriteQueue chan []byte
 	UserID     string
 	writeMu    sync.Mutex
@@ -77,6 +113,9 @@ type MailruDocsTransport struct {
 
 	weblink string
 	session *DocSession
+
+	// dial is realDialWS in production; tests replace it.
+	dial dialWS
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -126,6 +165,7 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 	t := &MailruDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		weblink:       normalizeWeblink(weblink),
+		dial:          realDialWS,
 	}
 	t.baseUserID = randUserID()
 	return t
@@ -340,19 +380,8 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		dialer := websocket.Dialer{
-			HandshakeTimeout: 15 * time.Second,
-			NetDialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		}
-		headers := http.Header{}
-		headers.Set("User-Agent", mailruUserAgent)
-		headers.Set("Origin", "https://docs.datacloudmail.ru")
-
 		utils.Debugf("[M-DOCS] WebSocket dial %s", info.WsURL)
-		conn, resp, err := dialer.Dial(info.WsURL, headers)
+		conn, resp, err := t.dial(info.WsURL)
 		if err != nil {
 			status := 0
 			if resp != nil {
@@ -609,18 +638,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 		return
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		NetDialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	}
-	headers := http.Header{}
-	headers.Set("User-Agent", mailruUserAgent)
-	headers.Set("Origin", "https://docs.datacloudmail.ru")
-
-	conn, _, err := dialer.Dial(info.WsURL, headers)
+	conn, _, err := t.dial(info.WsURL)
 	if err != nil {
 		utils.Infof("[%s] renewal deferred, dial: %v", t.name(), err)
 		t.scheduleRenewalIn(old, renewRetry)
@@ -709,7 +727,7 @@ func (t *MailruDocsTransport) renewSession(old *DocSession) {
 // whether it did. Frames arriving meanwhile are handled normally: this
 // connection is not carrying our traffic yet, but the server may already be
 // sending the other participant's.
-func (t *MailruDocsTransport) awaitJoinAck(session *DocSession, conn *websocket.Conn) bool {
+func (t *MailruDocsTransport) awaitJoinAck(session *DocSession, conn wsConn) bool {
 	// How long the server takes to answer is reported because the answer
 	// decides whether the timeout is the binding constraint. Measured with no
 	// timing at all: about half of every renewal attempt gave up here, on both
@@ -757,7 +775,7 @@ func isOpenPacket(msg []byte) bool {
 // it did. Frames arriving before it are handled normally rather than dropped —
 // there should be none, and swallowing one would be the same mistake that hid
 // the closures in the first place.
-func (t *MailruDocsTransport) awaitOpenPacket(session *DocSession, conn *websocket.Conn) bool {
+func (t *MailruDocsTransport) awaitOpenPacket(session *DocSession, conn wsConn) bool {
 	conn.SetReadDeadline(time.Now().Add(openPacketTimeout))
 	for {
 		_, msg, err := conn.ReadMessage()
