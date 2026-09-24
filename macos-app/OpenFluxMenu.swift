@@ -27,7 +27,7 @@ struct Profile: Codable {
     var maxUid = ""
     var debug = false
 
-    static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "oneme"]
+    static let transports = ["mailru", "vyandex", "yandex", "cupsonline", "jitsi", "oneme"]
 
     /// The documents this profile bonds, one per line in the editor. Several
     /// of them are what keeps the tunnel up when a provider closes one.
@@ -52,6 +52,7 @@ struct Profile: Codable {
         switch transport {
         case "cupsonline": return "комнаты ноды"
         case "oneme":      return "по учётным данным"
+        case "jitsi":      return "\(documents.count) комн."
         default:           return "\(documents.count) док."
         }
     }
@@ -813,17 +814,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settingsWindow = w
     }
 
-    /// cups.online does not take documents: the exit node creates its own
-    /// rooms at startup and prints one packed string for the client to use.
-    /// Asking for links there would be asking for something that does not
-    /// exist until the node has run, so the field means a different thing and
-    /// has to say so.
+    /// The URL field means a different thing for different transports:
+    /// cups.online takes one packed string of rooms the node printed at
+    /// startup; jitsi takes host/room links to Meet servers, one per line;
+    /// everything else takes one document link per line. The field's label
+    /// and its hint have to reflect that, or half the settings say the wrong
+    /// thing.
     @objc private func transportChanged() {
-        let cups = (fTransport.titleOfSelectedItem == "cupsonline")
-        fURLLabel.stringValue = cups ? "Комнаты:" : "Ссылки:"
-        fURLHint.stringValue = cups
-            ? "строку комнат печатает нода при запуске — скопируйте её оттуда целиком"
-            : "по одной ссылке в строке; тот же набор должен стоять на ноде"
+        let t = fTransport.titleOfSelectedItem
+        switch t {
+        case "cupsonline":
+            fURLLabel.stringValue = "Комнаты:"
+            fURLHint.stringValue = "строку комнат печатает нода при запуске — скопируйте её оттуда целиком"
+        case "jitsi":
+            fURLLabel.stringValue = "Комнаты:"
+            fURLHint.stringValue = "по одной комнате в строке в виде host/имя-комнаты; тот же набор должен стоять на ноде"
+        default:
+            fURLLabel.stringValue = "Ссылки:"
+            fURLHint.stringValue = "по одной ссылке в строке; тот же набор должен стоять на ноде"
+        }
     }
 
     private func reloadProfilePopup() {
