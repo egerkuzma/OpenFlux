@@ -15,6 +15,7 @@ import (
 	"openflux/socks5"
 	"openflux/transport"
 	"openflux/transport/cupsonline"
+	"openflux/transport/jitsi"
 	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
@@ -123,7 +124,7 @@ func main() {
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru, jitsi)")
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default, Linux only) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
@@ -183,6 +184,7 @@ TRANSPORT
   -t, --transport=oneme        MAX (VK) over WebRTC.
   -t, --transport=cupsonline   Cups.online interview rooms.
   -t, --transport=mailru       Mail.ru Docs over WebSocket.
+  -t, --transport=jitsi        Jitsi Meet conference over colibri-ws.
 
   -u, --url=<URL>              Document URL. Repeat it, or pass a comma-separated
                                list, to bond several documents into one channel:
@@ -367,6 +369,8 @@ DEPRECATED (removed in v2)
 			return cupsonline.NewCupsonlineTransport(docURL, config, *role != roleExit)
 		case "mailru":
 			return mailru.NewMailruDocsTransport(docURL, config)
+		case "jitsi":
+			return jitsi.NewJitsiTransport(docURL, config)
 		default:
 			log.Fatalf("Unknown transport type: %s", *transportType)
 			return nil
@@ -490,7 +494,7 @@ DEPRECATED (removed in v2)
 // urls therefore cannot match, by construction, and each peer derives a key the
 // other cannot use. oneme is driven by credentials and has the same problem.
 var sharesDocuments = map[string]bool{
-	"mailru": true, "yandex": true, "vyandex": true,
+	"mailru": true, "yandex": true, "vyandex": true, "jitsi": true,
 	"cupsonline": false, "oneme": false,
 }
 

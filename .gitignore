@@ -62,3 +62,9 @@ watch_stats.sh
 *.log
 openflux
 *.bak
+
+# Pool of specific working hosts — kept local, not committed to keep the repo
+# from doubling as a target list.
+transport/jitsi/pool.txt
+# The raw SNI scan is operator-side scratch data, not code.
+ru.sni.yaml

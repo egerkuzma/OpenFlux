@@ -52,7 +52,7 @@ const (
 // settings is everything the panel may change. Anything not here cannot be
 // passed to the node, which is the point: the set is the allowlist.
 type settings struct {
-	Transport string // mailru | yandex | vyandex | cupsonline
+	Transport string // mailru | yandex | vyandex | cupsonline | jitsi
 	Mode      string // l3 | l4
 	Codec     string // batched | legacy
 	Debug     bool
@@ -67,11 +67,11 @@ type settings struct {
 // prints the list for the client to use. Asking for documents there would be
 // asking for something that does not exist yet — the node is what produces it.
 var needsDocuments = map[string]bool{
-	"mailru": true, "yandex": true, "vyandex": true, "cupsonline": false,
+	"mailru": true, "yandex": true, "vyandex": true, "cupsonline": false, "jitsi": true,
 }
 
 var (
-	knownTransports = map[string]bool{"mailru": true, "yandex": true, "vyandex": true, "cupsonline": true}
+	knownTransports = map[string]bool{"mailru": true, "yandex": true, "vyandex": true, "cupsonline": true, "jitsi": true}
 	knownModes      = map[string]bool{"l3": true, "l4": true}
 	knownCodecs     = map[string]bool{"batched": true, "legacy": true}
 

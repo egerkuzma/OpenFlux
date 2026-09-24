@@ -91,6 +91,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:var(--b
         <option value="yandex" {{if eq $t "yandex"}}selected{{end}}>Яндекс.Документы</option>
         <option value="vyandex" {{if eq $t "vyandex"}}selected{{end}}>Яндекс.Волга</option>
         <option value="cupsonline" {{if eq $t "cupsonline"}}selected{{end}}>cups.online — комнаты создаёт нода</option>
+        <option value="jitsi" {{if eq $t "jitsi"}}selected{{end}}>Jitsi Meet — комнаты</option>
       </select></label>
     <label><div class="lab">Режим</div>
       <select name="mode">
